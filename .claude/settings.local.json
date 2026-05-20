@@ -17,7 +17,8 @@
       "Bash(curl -s -N -X POST http://localhost:3000/api/agent -H 'Content-Type: application/json' -d '{ *)",
       "Bash(git init *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
