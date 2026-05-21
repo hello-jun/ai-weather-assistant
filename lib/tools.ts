@@ -32,7 +32,7 @@ export const weatherToolDefinition = {
   },
 };
 
-interface WeatherResult {
+export interface WeatherResult {
   city: string;
   date: string;
   current: {
@@ -48,6 +48,75 @@ interface WeatherResult {
   };
 }
 
+export const locationToolDefinition = {
+  type: "function" as const,
+  function: {
+    name: "get_user_location",
+    description:
+      "获取用户当前所在城市。当用户询问天气但未指定城市时，先调用此工具获取城市名称，再用返回的城市名调用 get_weather 查询天气。",
+    parameters: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+};
+
+export interface ClientLocation {
+  latitude: number;
+  longitude: number;
+}
+
+const locationCache = new Map<string, { city: string } | { error: string }>();
+
+export async function getUserLocation(coords: ClientLocation | null): Promise<{ city: string } | { error: string }> {
+  if (!coords) {
+    return { error: "未获取到用户定位信息，请让用户手动指定城市。" };
+  }
+
+  const cacheKey = `${coords.latitude},${coords.longitude}`;
+  const cached = locationCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${coords.latitude}&lon=${coords.longitude}&format=json&accept-language=zh`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": "ai-weather-assistant/1.0" },
+    });
+    if (!res.ok) {
+      return { error: "地理编码服务暂时不可用，请让用户手动指定城市。" };
+    }
+    const data = await res.json();
+
+    if (data.error) {
+      return { error: "反向地理编码失败，请让用户手动指定城市。" };
+    }
+
+    // Extract city: state often has the city name in China (e.g. "北京市")
+    const state: string = data.address?.state || "";
+    const city: string = data.address?.city || "";
+
+    let result = "";
+    if (state.endsWith("市")) {
+      result = state;
+    } else if (city) {
+      result = city;
+    } else {
+      // Fallback: parse display_name for "X市" pattern
+      const match = data.display_name?.match(/([一-龥]{2,}市)/);
+      result = match ? match[1] : "";
+    }
+
+    if (result) {
+      const success = { city: result };
+      locationCache.set(cacheKey, success);
+      return success;
+    }
+    return { error: "无法从定位结果中提取城市名，请让用户手动指定城市。" };
+  } catch {
+    return { error: "地理编码服务暂时不可用，请让用户手动指定城市。" };
+  }
+}
+
 export async function getWeather(args: { city: string }): Promise<WeatherResult | { error: string }> {
   const { city } = args;
 
@@ -55,6 +124,9 @@ export async function getWeather(args: { city: string }): Promise<WeatherResult 
     // Step 1: Geocoding — city name → coordinates
     const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`;
     const geoRes = await fetch(geoUrl);
+    if (!geoRes.ok) {
+      return { error: "地理编码服务暂时不可用，请稍后重试。" };
+    }
     const geoData = await geoRes.json();
 
     if (!geoData.results?.length) {
@@ -66,6 +138,9 @@ export async function getWeather(args: { city: string }): Promise<WeatherResult 
     // Step 2: Fetch weather forecast
     const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code&forecast_days=1&timezone=auto`;
     const weatherRes = await fetch(weatherUrl);
+    if (!weatherRes.ok) {
+      return { error: "天气数据服务暂时不可用，请稍后重试。" };
+    }
     const weatherData = await weatherRes.json();
 
     const location = country ? `${name}(${country})` : name;

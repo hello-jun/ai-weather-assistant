@@ -2,6 +2,8 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { HttpAgent } from "@ag-ui/client";
+import { WeatherCard } from "./weather-card";
+import type { WeatherResult, ClientLocation } from "@/lib/tools";
 
 interface ChatMessage {
   id: string;
@@ -9,6 +11,7 @@ interface ChatMessage {
   content: string;
   isStreaming?: boolean;
   toolStatus?: string;
+  weatherData?: WeatherResult;
 }
 
 export function ChatApp() {
@@ -19,6 +22,23 @@ export function ChatApp() {
   const pendingContentRef = useRef("");
   const pendingMsgIdRef = useRef("");
   const errorHandledRef = useRef(false);
+  const locationRef = useRef<ClientLocation | null>(null);
+
+  // Detect user location on mount via browser Geolocation API
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        locationRef.current = {
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+        };
+      },
+      () => {
+        // Permission denied or unavailable — locationRef stays null
+      }
+    );
+  }, []);
 
   // Initialize agent once
   useEffect(() => {
@@ -59,9 +79,26 @@ export function ChatApp() {
         );
       },
 
+      onToolCallResultEvent({ event }) {
+        try {
+          const result = JSON.parse((event as { content: string }).content);
+          if (result && result.city && result.current) {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === pendingMsgIdRef.current
+                  ? { ...m, weatherData: result as WeatherResult }
+                  : m
+              )
+            );
+          }
+        } catch {
+          // Not valid JSON or not weather data — ignore
+        }
+      },
+
       onRunErrorEvent({ event }) {
         errorHandledRef.current = true;
-        const msg = (event as any).message || "未知错误";
+        const msg = (event as { message?: string }).message || "未知错误";
         setMessages((prev) =>
           prev.map((m) =>
             m.id === pendingMsgIdRef.current
@@ -102,7 +139,11 @@ export function ChatApp() {
 
       try {
         agent.addMessage({ id: userMsg.id, role: "user", content: text });
-        await agent.runAgent();
+        await agent.runAgent({
+          context: locationRef.current
+            ? [{ value: JSON.stringify(locationRef.current), description: "user_location" }]
+            : [],
+        });
       } catch (err) {
         // Only show the catch-block error if the subscriber didn't already handle an error event
         if (!errorHandledRef.current) {
@@ -165,18 +206,23 @@ export function ChatApp() {
             className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
           >
             <div
-              className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap break-words ${
+              className={`max-w-[85%] rounded-2xl text-sm leading-relaxed break-words ${
                 msg.role === "user"
-                  ? "bg-blue-500 text-white rounded-br-md"
-                  : "bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm"
+                  ? "bg-blue-500 text-white rounded-br-md px-4 py-3 whitespace-pre-wrap"
+                  : `bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm ${
+                      msg.weatherData ? "p-0 overflow-hidden" : "px-4 py-3 whitespace-pre-wrap"
+                    }`
               }`}
             >
+              {msg.role === "assistant" && msg.weatherData && (
+                <WeatherCard data={msg.weatherData} />
+              )}
               {msg.toolStatus && (
-                <div className="text-xs text-blue-500 mb-1 animate-pulse">
+                <div className={`text-xs text-blue-500 animate-pulse ${msg.weatherData ? "px-4 pt-3" : "mb-1"}`}>
                   🔧 {msg.toolStatus}
                 </div>
               )}
-              <div>
+              <div className={msg.weatherData ? "px-4 py-3" : ""}>
                 {msg.content}
                 {msg.isStreaming && !msg.content && (
                   <span className="inline-flex gap-1 ml-1">
