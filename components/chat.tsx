@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { HttpAgent } from "@ag-ui/client";
 import { WeatherCard } from "./weather-card";
-import type { WeatherResult, ClientLocation } from "@/lib/tools";
+import type { WeatherResult } from "@/lib/tools";
 
 interface ChatMessage {
   id: string;
@@ -22,23 +22,19 @@ export function ChatApp() {
   const pendingContentRef = useRef("");
   const pendingMsgIdRef = useRef("");
   const errorHandledRef = useRef(false);
-  const locationRef = useRef<ClientLocation | null>(null);
+  const clientToolContinuationRef = useRef(false);
 
-  // Detect user location on mount via browser Geolocation API
-  useEffect(() => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        locationRef.current = {
-          latitude: pos.coords.latitude,
-          longitude: pos.coords.longitude,
-        };
+  // Client-side tool definitions
+  const CLIENT_TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "get_user_location",
+        description: "获取用户当前所在城市。当用户询问天气但未指定城市时调用。",
+        parameters: { type: "object" as const, properties: {} },
       },
-      () => {
-        // Permission denied or unavailable — locationRef stays null
-      }
-    );
-  }, []);
+    },
+  ];
 
   // Initialize agent once
   useEffect(() => {
@@ -69,7 +65,12 @@ export function ChatApp() {
         );
       },
 
-      onToolCallEndEvent() {
+      onToolCallEndEvent({ event, toolCallName, toolCallArgs }) {
+        if (toolCallName === "get_user_location") {
+          // Client-side tool — execute in browser
+          executeClientTool(event.toolCallId, toolCallArgs);
+          return;
+        }
         setMessages((prev) =>
           prev.map((m) =>
             m.id === pendingMsgIdRef.current
@@ -112,6 +113,105 @@ export function ChatApp() {
     agentRef.current = agent;
   }, []);
 
+  // Execute a client-side tool (called when LLM requests get_user_location)
+  const executeClientTool = useCallback(
+    async (toolCallId: string, _args: Record<string, unknown>) => {
+      const agent = agentRef.current;
+      if (!agent) return;
+
+      const currentMsgId = pendingMsgIdRef.current;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === currentMsgId ? { ...m, toolStatus: "正在获取您的位置..." } : m
+        )
+      );
+
+      clientToolContinuationRef.current = true;
+
+      // Step 1: Get browser geolocation
+      let coords: { latitude: number; longitude: number };
+      try {
+        coords = await new Promise((resolve, reject) => {
+          if (!navigator.geolocation) {
+            reject(new Error("浏览器不支持定位"));
+            return;
+          }
+          navigator.geolocation.getCurrentPosition(
+            (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+            (err) => reject(err),
+            { timeout: 10000 }
+          );
+        });
+      } catch {
+        const errorResult = JSON.stringify({ error: "未获取到用户定位信息，请让用户手动指定城市。" });
+        agent.addMessage({ id: crypto.randomUUID(), role: "assistant", content: "", toolCalls: [{ id: toolCallId, type: "function" as const, function: { name: "get_user_location", arguments: "{}" } }] });
+        agent.addMessage({ id: crypto.randomUUID(), role: "tool", content: errorResult, toolCallId });
+        setMessages((prev) =>
+          prev.map((m) => (m.id === currentMsgId ? { ...m, toolStatus: undefined } : m))
+        );
+        await agent.runAgent({ tools: CLIENT_TOOLS });
+        return;
+      }
+
+      // Step 2: Reverse geocode via Nominatim
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === currentMsgId ? { ...m, toolStatus: "正在解析城市..." } : m
+        )
+      );
+
+      let locationResult: string;
+      try {
+        const url = `https://nominatim.openstreetmap.org/reverse?lat=${coords.latitude}&lon=${coords.longitude}&format=json&accept-language=zh`;
+        const res = await fetch(url, { headers: { "User-Agent": "ai-weather-assistant/1.0" } });
+        if (!res.ok) throw new Error("geocoding failed");
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        const state: string = data.address?.state || "";
+        const city: string = data.address?.city || "";
+        let cityName = "";
+        if (state.endsWith("市")) cityName = state;
+        else if (city) cityName = city;
+        else {
+          const match = data.display_name?.match(/([一-龥]{2,}市)/);
+          cityName = match ? match[1] : "";
+        }
+
+        locationResult = cityName
+          ? JSON.stringify({ city: cityName })
+          : JSON.stringify({ error: "无法从定位结果中提取城市名，请让用户手动指定城市。" });
+      } catch {
+        locationResult = JSON.stringify({ error: "地理编码服务暂时不可用，请让用户手动指定城市。" });
+      }
+
+      // Step 3: Append tool messages and continue the conversation
+      agent.addMessage({
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: toolCallId, type: "function" as const, function: { name: "get_user_location", arguments: "{}" } }],
+      });
+      agent.addMessage({ id: crypto.randomUUID(), role: "tool", content: locationResult, toolCallId });
+
+      setMessages((prev) =>
+        prev.map((m) => (m.id === currentMsgId ? { ...m, toolStatus: undefined } : m))
+      );
+
+      await agent.runAgent({ tools: CLIENT_TOOLS });
+
+      // Client tool continuation done
+      clientToolContinuationRef.current = false;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === pendingMsgIdRef.current ? { ...m, isStreaming: false, toolStatus: undefined } : m
+        )
+      );
+      setIsRunning(false);
+    },
+    []
+  );
+
   const sendMessage = useCallback(
     async (text: string) => {
       const agent = agentRef.current;
@@ -139,11 +239,7 @@ export function ChatApp() {
 
       try {
         agent.addMessage({ id: userMsg.id, role: "user", content: text });
-        await agent.runAgent({
-          context: locationRef.current
-            ? [{ value: JSON.stringify(locationRef.current), description: "user_location" }]
-            : [],
-        });
+        await agent.runAgent({ tools: CLIENT_TOOLS });
       } catch (err) {
         // Only show the catch-block error if the subscriber didn't already handle an error event
         if (!errorHandledRef.current) {
@@ -160,12 +256,15 @@ export function ChatApp() {
           );
         }
       } finally {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === aiMsgId ? { ...m, isStreaming: false, toolStatus: undefined } : m
-          )
-        );
-        setIsRunning(false);
+        // If executeClientTool is handling continuation, let it manage isRunning
+        if (!clientToolContinuationRef.current) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiMsgId ? { ...m, isStreaming: false, toolStatus: undefined } : m
+            )
+          );
+          setIsRunning(false);
+        }
       }
     },
     [isRunning]

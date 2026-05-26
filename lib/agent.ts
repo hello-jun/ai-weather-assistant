@@ -1,6 +1,5 @@
 import { deepseek } from "./deepseek";
-import { getWeather, getUserLocation } from "./tools";
-import type { ClientLocation } from "./tools";
+import { getWeather } from "./tools";
 import type OpenAI from "openai";
 
 // AG-UI event types (matching @ag-ui/core EventType enum values)
@@ -43,14 +42,13 @@ interface AguiEvent {
   [key: string]: unknown;
 }
 
-export interface ClientContext {
-  location?: ClientLocation;
-}
+// Client-side tool names — server emits TOOL_CALL events but does not execute them
+const CLIENT_TOOLS = new Set(["get_user_location"]);
 
 const SYSTEM_MESSAGE: OpenAI.Chat.Completions.ChatCompletionSystemMessageParam = {
   role: "system",
   content:
-    "你是一个专业的天气预报助手。你能用 get_weather 工具查询指定城市的实时天气，用 get_user_location 工具获取用户当前所在城市。请用中文回复，语气友好亲切。当用户询问天气时，如果用户没有指定城市，先调用 get_user_location 获取城市，再调用 get_weather 查询天气；如果用户已经指定了城市，直接调用 get_weather。",
+    "你是一个专业的天气预报助手。你能用 get_weather 工具查询指定城市的实时天气，用 get_user_location 工具获取用户当前所在城市。请用中文回复，语气友好亲切。当用户询问天气时，如果用户没有指定城市，先调用 get_user_location 获取城市，再调用 get_weather 查询天气；如果用户已经指定了城市，直接调用 get_weather。注意：get_user_location 由客户端执行，调用后会中断当前对话，客户端会在执行完成后重新发起请求。",
 };
 
 /** Convert AG-UI messages to DeepSeek/OpenAI format (system message already included) */
@@ -100,15 +98,10 @@ function toOpenAITools(tools?: AguiToolDef[]): OpenAI.Chat.Completions.ChatCompl
 /** Execute a tool call locally */
 async function executeTool(
   name: string,
-  args: Record<string, unknown>,
-  clientContext: ClientContext
+  args: Record<string, unknown>
 ): Promise<string> {
   if (name === "get_weather") {
     const result = await getWeather({ city: args.city as string });
-    return JSON.stringify(result, null, 2);
-  }
-  if (name === "get_user_location") {
-    const result = await getUserLocation(clientContext.location ?? null);
     return JSON.stringify(result, null, 2);
   }
   return JSON.stringify({ error: `未知工具: ${name}` });
@@ -120,8 +113,7 @@ async function executeTool(
  */
 export async function* runAgent(
   messages: AguiMessage[],
-  tools: AguiToolDef[],
-  clientContext: ClientContext
+  tools: AguiToolDef[]
 ): AsyncGenerator<AguiEvent> {
   const runId = crypto.randomUUID();
   const threadId = crypto.randomUUID();
@@ -130,7 +122,7 @@ export async function* runAgent(
 
   let errored = false;
   try {
-    const result = await runConversation({ runId, messages, tools, clientContext });
+    const result = await runConversation({ runId, messages, tools });
     for await (const event of result) {
       yield event;
     }
@@ -152,9 +144,8 @@ async function* runConversation(params: {
   runId: string;
   messages: AguiMessage[];
   tools: AguiToolDef[];
-  clientContext: ClientContext;
 }): AsyncGenerator<AguiEvent> {
-  const { messages, tools, clientContext } = params;
+  const { messages, tools } = params;
   let currentMessages = [...messages];
   const openaiTools = toOpenAITools(tools);
 
@@ -231,6 +222,7 @@ async function* runConversation(params: {
 
     // Emit tool call events + execute
     const toolResultMessages: AguiMessage[] = [];
+    let hasClientTool = false;
 
     for (const tc of toolCalls) {
       yield {
@@ -250,7 +242,7 @@ async function* runConversation(params: {
         toolCallId: tc.id,
       };
 
-      // Execute the tool
+      // Parse tool arguments
       let parsedArgs: Record<string, unknown>;
       try {
         parsedArgs = JSON.parse(tc.arguments);
@@ -258,7 +250,21 @@ async function* runConversation(params: {
         parsedArgs = {};
       }
 
-      const result = await executeTool(tc.name, parsedArgs, clientContext);
+      // Client-side tools: emit a tagged result and skip execution
+      if (CLIENT_TOOLS.has(tc.name)) {
+        yield {
+          type: E.TOOL_CALL_RESULT,
+          messageId: crypto.randomUUID(),
+          toolCallId: tc.id,
+          content: "",
+          role: "tool",
+          metadata: { clientTool: true },
+        };
+        hasClientTool = true;
+        continue;
+      }
+
+      const result = await executeTool(tc.name, parsedArgs);
 
       yield {
         type: E.TOOL_CALL_RESULT,
@@ -276,6 +282,9 @@ async function* runConversation(params: {
         content: result,
       });
     }
+
+    // Client tool detected — end the run so the client can execute it and continue
+    if (hasClientTool) break;
 
     // Append assistant message (with tool_calls) + tool results to messages
     const assistantMsg: AguiMessage = {
