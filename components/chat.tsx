@@ -3,6 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { HttpAgent } from "@ag-ui/client";
 import { WeatherCard } from "./weather-card";
+import { TipsCard } from "./tips-card";
 import type { WeatherResult } from "@/lib/tools";
 
 interface ChatMessage {
@@ -12,6 +13,27 @@ interface ChatMessage {
   isStreaming?: boolean;
   toolStatus?: string;
   weatherData?: WeatherResult;
+  tips?: string[];
+}
+
+/** Extract <tips> content from LLM text, returning [cleanText, tips[]] */
+function extractTips(text: string): [string, string[] | undefined] {
+  const openIdx = text.indexOf("<tips>");
+  if (openIdx === -1) return [text, undefined];
+
+  const afterOpen = text.slice(openIdx + 6);
+  // closing tag may be incomplete (streaming) or missing '>' — handle both
+  const closeIdx = afterOpen.search(/<\/tips/);
+  const tipsText = closeIdx !== -1 ? afterOpen.slice(0, closeIdx) : afterOpen;
+
+  const tips = tipsText
+    .split("\n")
+    .map((s) => s.replace(/^[-•*\s]+/, "").trim())
+    .filter(Boolean);
+  if (tips.length === 0) return [text, undefined];
+
+  const cleanText = text.slice(0, openIdx).replace(/\n+$/, "").trim();
+  return [cleanText, tips];
 }
 
 export function ChatApp() {
@@ -321,19 +343,30 @@ export function ChatApp() {
                   🔧 {msg.toolStatus}
                 </div>
               )}
-              <div className={msg.weatherData ? "px-4 py-3" : ""}>
-                {msg.content}
-                {msg.isStreaming && !msg.content && (
-                  <span className="inline-flex gap-1 ml-1">
-                    <span className="w-1.5 h-4 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                    <span className="w-1.5 h-4 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                    <span className="w-1.5 h-4 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
-                  </span>
-                )}
-                {msg.isStreaming && msg.content && (
-                  <span className="inline-block w-1.5 h-4 bg-blue-400 ml-0.5 animate-pulse rounded-sm align-middle" />
-                )}
-              </div>
+              {(() => {
+                const isAssistantText = msg.role === "assistant" && msg.content;
+                if (!isAssistantText) return null;
+                const [cleanText, tips] = extractTips(msg.content);
+                const displayText = tips ? cleanText : msg.content;
+                return (
+                  <>
+                    <div className={msg.weatherData ? "px-4 py-3" : ""}>
+                      {displayText}
+                      {msg.isStreaming && !msg.content && (
+                        <span className="inline-flex gap-1 ml-1">
+                          <span className="w-1.5 h-4 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                          <span className="w-1.5 h-4 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                          <span className="w-1.5 h-4 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                        </span>
+                      )}
+                      {msg.isStreaming && msg.content && (
+                        <span className="inline-block w-1.5 h-4 bg-blue-400 ml-0.5 animate-pulse rounded-sm align-middle" />
+                      )}
+                    </div>
+                    {tips && <TipsCard tips={tips} />}
+                  </>
+                );
+              })()}
             </div>
           </div>
         ))}
