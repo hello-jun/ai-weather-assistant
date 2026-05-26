@@ -17,7 +17,7 @@ This is a **Next.js 15 App Router** weather AI assistant that streams responses 
 
 ### Request flow
 
-1. `components/chat.tsx` — Client component using `HttpAgent` from `@ag-ui/client`. Subscribes to AG-UI events (`onTextMessageContentEvent`, `onToolCallStartEvent`, etc.) and renders streaming text updates. Sends user messages via `agent.addMessage()` + `agent.runAgent()`, which POSTs to `/api/agent`.
+1. `components/chat.tsx` — Client component using `HttpAgent` from `@ag-ui/client`. Subscribes to AG-UI events (`onTextMessageContentEvent`, `onToolCallStartEvent`, etc.) and renders streaming text updates. Sends user messages via `agent.addMessage()` + `agent.runAgent()`, which POSTs to `/api/agent`. Parses `<tips>` tags from LLM responses via `extractTips()` and renders them as `TipsCard` alongside `WeatherCard` for weather data.
 
 2. `app/api/agent/route.ts` — Edge-adjacent Node.js API route. Receives `{ messages, tools }`, merges the built-in `weatherToolDefinition` with any client-provided tools, and streams AG-UI events as SSE (`text/event-stream`). Each event is emitted as `data: <JSON>\n\n`. Never sends `data: [DONE]` — the AG-UI client uses `RUN_FINISHED` + connection close to detect completion.
 
@@ -25,7 +25,11 @@ This is a **Next.js 15 App Router** weather AI assistant that streams responses 
 
 4. `lib/deepseek.ts` — Minimal DeepSeek API client using the OpenAI SDK v4 with `baseURL: "https://api.deepseek.com"`. Do NOT append `/v1` to the base URL; the SDK handles path construction.
 
-5. `lib/tools.ts` — Weather tool definition (OpenAI function schema) + execution via free Open-Meteo APIs: geocoding (`geocoding-api.open-meteo.com/v1/search`) then forecast (`api.open-meteo.com/v1/forecast`). Includes WMO weather code → Chinese description mapping.
+5. `lib/tools.ts` — Weather tool definition (OpenAI function schema) + execution with dual-API fallback. Primary: Open-Meteo (geocoding → forecast, with retry for 5xx). Fallback: wttr.in (free, no API key, accepts city names directly). Falls back automatically when Open-Meteo is unavailable. Includes WMO weather code → Chinese description mapping.
+
+6. `components/weather-card.tsx` — Gradient weather card rendered when a message has `weatherData`. Styled per WMO weather code (sunny=orange, rain=blue, snow=ice-blue, etc.) with temperature, humidity, wind speed, and daily high/low.
+
+7. `components/tips-card.tsx` — Amber-themed card for LLM-generated travel advice. Triggered by `<tips>` tags in the LLM response text.
 
 ### Key implementation details
 
@@ -33,6 +37,8 @@ This is a **Next.js 15 App Router** weather AI assistant that streams responses 
 - **Tool messages**: When sending tool results back to the LLM, `tool_call_id` must use the LLM's tool call ID (from `tool_calls[].id`), not the message's own UUID.
 - **Weather tool is always auto-merged** into the tools array on the server side — the client doesn't need to pass it explicitly, passing `tools: []` still gets weather support.
 - **Environment**: Requires `DEEPSEEK_API_KEY` in `.env.local` (acquired from https://platform.deepseek.com).
+- **Tips system**: The system prompt instructs the LLM to wrap travel advice in `<tips>...</tips>` tags. The frontend `extractTips()` function (in `chat.tsx`) uses `indexOf`-based parsing — NOT regex — because DeepSeek's streaming can drop the final `>` of `</tips>`, making regex `/<tips>([\s\S]*?)<\/tips>/` fail. The parser only requires `<tips>` opening tag and `</tips` prefix to locate boundaries.
+- **Client-side tools**: `get_user_location` is a client-side tool — when the LLM calls it, the server emits `TOOL_CALL_RESULT` with `metadata: { clientTool: true }` and breaks the loop. The client executes the tool (browser geolocation → Nominatim reverse geocoding) and re-invokes `agent.runAgent()` with the result appended as a tool message. The `clientToolContinuationRef` flag prevents `sendMessage`'s finally block from prematurely setting `isStreaming: false`.
 
 ---
 
