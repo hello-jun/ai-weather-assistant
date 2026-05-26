@@ -25,7 +25,8 @@
       "Bash(curl *)",
       "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d.get\\('address',{}\\), ensure_ascii=False, indent=2\\)\\)\")",
       "Bash(node -e \"const path = require.resolve\\('@ag-ui/client'\\); console.log\\(path\\)\")",
-      "WebFetch(domain:chat.deepseek.com)"
+      "WebFetch(domain:chat.deepseek.com)",
+      "Bash(git update-index *)"
     ]
   },
   "statusLine": {
