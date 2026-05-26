@@ -1,6 +1,7 @@
 import { deepseek } from "./deepseek";
 import { getWeather } from "./tools";
 import type OpenAI from "openai";
+import type { A2UIMessage } from "./a2ui-types";
 
 // AG-UI event types (matching @ag-ui/core EventType enum values)
 const E = {
@@ -14,7 +15,26 @@ const E = {
   TOOL_CALL_ARGS: "TOOL_CALL_ARGS",
   TOOL_CALL_END: "TOOL_CALL_END",
   TOOL_CALL_RESULT: "TOOL_CALL_RESULT",
+  CUSTOM: "CUSTOM",
 } as const;
+
+const WEATHER_CATALOG_ID = "https://weather-assistant.local/a2ui/catalogs/weather/v1";
+
+function a2uiEvent(message: A2UIMessage): AguiEvent {
+  if ("createSurface" in message) {
+    return { type: E.CUSTOM, name: "a2ui_create_surface", value: message.createSurface };
+  }
+  if ("updateComponents" in message) {
+    return { type: E.CUSTOM, name: "a2ui_update_components", value: message.updateComponents };
+  }
+  if ("updateDataModel" in message) {
+    return { type: E.CUSTOM, name: "a2ui_update_data_model", value: message.updateDataModel };
+  }
+  if ("deleteSurface" in message) {
+    return { type: E.CUSTOM, name: "a2ui_delete_surface", value: message.deleteSurface };
+  }
+  throw new Error("Unknown A2UI message type");
+}
 
 interface AguiMessage {
   id: string;
@@ -63,14 +83,16 @@ function toOpenAIMessages(messages: AguiMessage[]): OpenAI.Chat.Completions.Chat
         role: "assistant",
         content: m.content || "",
         ...(m.toolCalls?.length && {
-          tool_calls: m.toolCalls.map((tc) => ({
-            id: tc.id,
-            type: "function" as const,
-            function: {
-              name: tc.function.name,
-              arguments: tc.function.arguments,
-            },
-          })),
+          tool_calls: m.toolCalls
+            .filter((tc) => tc?.function?.name)
+            .map((tc) => ({
+              id: tc.id,
+              type: "function" as const,
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              },
+            })),
         }),
       });
     } else if (m.role === "tool") {
@@ -148,6 +170,7 @@ async function* runConversation(params: {
   const { messages, tools } = params;
   let currentMessages = [...messages];
   const openaiTools = toOpenAITools(tools);
+  let currentWeatherSurfaceId: string | null = null;
 
   for (let round = 0; round < 3; round++) {
     // Build the full message list with system prompt first (only round 0 includes it implicitly via prepend)
@@ -216,7 +239,28 @@ async function* runConversation(params: {
       .map(([, v]) => v);
 
     if (toolCalls.length === 0) {
-      // No tool calls, conversation done
+      // No tool calls — check for tips in the text and emit A2UI data model update
+      if (fullContent) {
+        const tips = extractTips(fullContent);
+        if (tips) {
+          // Attach tips to the existing weather surface, or create a standalone tips surface
+          const surfaceId = currentWeatherSurfaceId || `tips-${msgId}`;
+          if (!currentWeatherSurfaceId) {
+            yield a2uiEvent({ version: "v0.9", createSurface: { surfaceId, catalogId: WEATHER_CATALOG_ID } });
+            yield a2uiEvent({
+              version: "v0.9",
+              updateComponents: {
+                surfaceId,
+                components: [{ id: "root", component: "TipsCard" }],
+              },
+            });
+          }
+          yield a2uiEvent({
+            version: "v0.9",
+            updateDataModel: { surfaceId, path: "/tips", value: tips },
+          });
+        }
+      }
       break;
     }
 
@@ -274,6 +318,35 @@ async function* runConversation(params: {
         role: "tool",
       };
 
+      // Emit A2UI events for weather tool results
+      if (tc.name === "get_weather") {
+        try {
+          const parsed = JSON.parse(result);
+          if (parsed && parsed.city && parsed.current) {
+            const surfaceId = `weather-${msgId}`;
+            currentWeatherSurfaceId = surfaceId;
+            yield a2uiEvent({ version: "v0.9", createSurface: { surfaceId, catalogId: WEATHER_CATALOG_ID } });
+            yield a2uiEvent({
+              version: "v0.9",
+              updateComponents: {
+                surfaceId,
+                components: [
+                  { id: "root", component: "Column", children: ["weather_card", "tips_card"] },
+                  { id: "weather_card", component: "WeatherCard" },
+                  { id: "tips_card", component: "TipsCard" },
+                ],
+              },
+            });
+            yield a2uiEvent({
+              version: "v0.9",
+              updateDataModel: { surfaceId, path: "/weather", value: parsed },
+            });
+          }
+        } catch {
+          // Not valid weather data — skip A2UI
+        }
+      }
+
       // Add to messages for next LLM call
       toolResultMessages.push({
         id: crypto.randomUUID(),
@@ -302,4 +375,21 @@ async function* runConversation(params: {
   }
 
   // If the model didn't produce tool calls, we're done in the first round
+}
+
+/** Server-side tips extraction from <tips> tags */
+function extractTips(text: string): string[] | null {
+  const openIdx = text.indexOf("<tips>");
+  if (openIdx === -1) return null;
+
+  const afterOpen = text.slice(openIdx + 6);
+  const closeIdx = afterOpen.search(/<\/tips/);
+  const tipsText = closeIdx !== -1 ? afterOpen.slice(0, closeIdx) : afterOpen;
+
+  const tips = tipsText
+    .split("\n")
+    .map((s) => s.replace(/^[-•*\s]+/, "").trim())
+    .filter(Boolean);
+
+  return tips.length > 0 ? tips : null;
 }

@@ -4,6 +4,8 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { HttpAgent } from "@ag-ui/client";
 import { WeatherCard } from "./weather-card";
 import { TipsCard } from "./tips-card";
+import { a2uiRenderer } from "@/lib/a2ui-renderer";
+import { weatherCatalogRegistry } from "./a2ui-components";
 import type { WeatherResult } from "@/lib/tools";
 
 interface ChatMessage {
@@ -14,6 +16,7 @@ interface ChatMessage {
   toolStatus?: string;
   weatherData?: WeatherResult;
   tips?: string[];
+  a2uiSurfaceId?: string;
 }
 
 /** Extract <tips> content from LLM text, returning [cleanText, tips[]] */
@@ -22,7 +25,6 @@ function extractTips(text: string): [string, string[] | undefined] {
   if (openIdx === -1) return [text, undefined];
 
   const afterOpen = text.slice(openIdx + 6);
-  // closing tag may be incomplete (streaming) or missing '>' — handle both
   const closeIdx = afterOpen.search(/<\/tips/);
   const tipsText = closeIdx !== -1 ? afterOpen.slice(0, closeIdx) : afterOpen;
 
@@ -40,21 +42,19 @@ export function ChatApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
+  const [, setRenderTick] = useState(0);
   const agentRef = useRef<HttpAgent | null>(null);
   const pendingContentRef = useRef("");
   const pendingMsgIdRef = useRef("");
   const errorHandledRef = useRef(false);
   const clientToolContinuationRef = useRef(false);
 
-  // Client-side tool definitions
+  // Client-side tool definitions (AG-UI format: { name, description, parameters })
   const CLIENT_TOOLS = [
     {
-      type: "function" as const,
-      function: {
-        name: "get_user_location",
-        description: "获取用户当前所在城市。当用户询问天气但未指定城市时调用。",
-        parameters: { type: "object" as const, properties: {} },
-      },
+      name: "get_user_location",
+      description: "获取用户当前所在城市。当用户询问天气但未指定城市时调用。",
+      parameters: { type: "object" as const, properties: {} },
     },
   ];
 
@@ -89,7 +89,6 @@ export function ChatApp() {
 
       onToolCallEndEvent({ event, toolCallName, toolCallArgs }) {
         if (toolCallName === "get_user_location") {
-          // Client-side tool — execute in browser
           executeClientTool(event.toolCallId, toolCallArgs);
           return;
         }
@@ -129,6 +128,42 @@ export function ChatApp() {
               : m
           )
         );
+      },
+
+      // A2UI event handling via AG-UI CUSTOM events
+      onCustomEvent({ event }) {
+        const { name, value } = event as { name: string; value: Record<string, unknown> };
+        const msgId = pendingMsgIdRef.current;
+
+        if (name === "a2ui_create_surface") {
+          a2uiRenderer.createSurface(
+            value.surfaceId as string,
+            value.catalogId as string
+          );
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === msgId
+                ? { ...m, a2uiSurfaceId: value.surfaceId as string }
+                : m
+            )
+          );
+        } else if (name === "a2ui_update_components") {
+          a2uiRenderer.updateComponents(
+            value.surfaceId as string,
+            value.components as import("@/lib/a2ui-types").A2UIComponent[]
+          );
+          setRenderTick((t) => t + 1);
+        } else if (name === "a2ui_update_data_model") {
+          a2uiRenderer.updateDataModel(
+            value.surfaceId as string,
+            value.path as string | undefined,
+            value.value
+          );
+          setRenderTick((t) => t + 1);
+        } else if (name === "a2ui_delete_surface") {
+          a2uiRenderer.deleteSurface(value.surfaceId as string);
+          setRenderTick((t) => t + 1);
+        }
       },
     });
 
@@ -263,7 +298,6 @@ export function ChatApp() {
         agent.addMessage({ id: userMsg.id, role: "user", content: text });
         await agent.runAgent({ tools: CLIENT_TOOLS });
       } catch (err) {
-        // Only show the catch-block error if the subscriber didn't already handle an error event
         if (!errorHandledRef.current) {
           setMessages((prev) =>
             prev.map((m) =>
@@ -278,7 +312,6 @@ export function ChatApp() {
           );
         }
       } finally {
-        // If executeClientTool is handling continuation, let it manage isRunning
         if (!clientToolContinuationRef.current) {
           setMessages((prev) =>
             prev.map((m) =>
@@ -309,7 +342,7 @@ export function ChatApp() {
         <h1 className="text-lg font-semibold text-gray-800">
           🌤️ 天气预报 AI 助手
         </h1>
-        <p className="text-xs text-gray-400">基于 DeepSeek V4 · 流式实时回复</p>
+        <p className="text-xs text-gray-400">基于 DeepSeek V4 · A2UI 协议</p>
       </header>
 
       {/* Message list */}
@@ -331,15 +364,24 @@ export function ChatApp() {
                 msg.role === "user"
                   ? "bg-blue-500 text-white rounded-br-md px-4 py-3 whitespace-pre-wrap"
                   : `bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm ${
-                      msg.weatherData ? "p-0 overflow-hidden" : "px-4 py-3 whitespace-pre-wrap"
+                      msg.a2uiSurfaceId || msg.weatherData ? "p-0 overflow-hidden" : "px-4 py-3 whitespace-pre-wrap"
                     }`
               }`}
             >
-              {msg.role === "assistant" && msg.weatherData && (
+              {/* A2UI surface rendering (primary path) */}
+              {msg.role === "assistant" && msg.a2uiSurfaceId && (() => {
+                const surface = a2uiRenderer.getSurface(msg.a2uiSurfaceId);
+                if (!surface) return null;
+                return <>{a2uiRenderer.renderSurface(msg.a2uiSurfaceId, weatherCatalogRegistry)}</>;
+              })()}
+
+              {/* Legacy weather card (fallback) */}
+              {msg.role === "assistant" && !msg.a2uiSurfaceId && msg.weatherData && (
                 <WeatherCard data={msg.weatherData} />
               )}
+
               {msg.toolStatus && (
-                <div className={`text-xs text-blue-500 animate-pulse ${msg.weatherData ? "px-4 pt-3" : "mb-1"}`}>
+                <div className={`text-xs text-blue-500 animate-pulse ${msg.a2uiSurfaceId || msg.weatherData ? "px-4 pt-3" : "mb-1"}`}>
                   🔧 {msg.toolStatus}
                 </div>
               )}
@@ -350,7 +392,7 @@ export function ChatApp() {
                 const displayText = tips ? cleanText : msg.content;
                 return (
                   <>
-                    <div className={msg.weatherData ? "px-4 py-3" : ""}>
+                    <div className={msg.a2uiSurfaceId || msg.weatherData ? "px-4 py-3" : ""}>
                       {displayText}
                       {msg.isStreaming && !msg.content && (
                         <span className="inline-flex gap-1 ml-1">
@@ -363,7 +405,8 @@ export function ChatApp() {
                         <span className="inline-block w-1.5 h-4 bg-blue-400 ml-0.5 animate-pulse rounded-sm align-middle" />
                       )}
                     </div>
-                    {tips && <TipsCard tips={tips} />}
+                    {/* Legacy tips rendering (fallback when A2UI is not active) */}
+                    {tips && !msg.a2uiSurfaceId && <TipsCard tips={tips} />}
                   </>
                 );
               })()}
