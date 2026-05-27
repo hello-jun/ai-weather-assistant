@@ -13,29 +13,41 @@ npx tsc --noEmit # Type-check without emitting files
 
 ## Architecture
 
-This is a **Next.js 15 App Router** weather AI assistant that streams responses via the **AG-UI Protocol** over SSE, backed by DeepSeek V4 API with function calling.
+This is a **Next.js 15 App Router** weather AI assistant that streams responses via the **AG-UI Protocol** + **A2UI v0.9 Protocol** over SSE, backed by DeepSeek V4 API with function calling.
 
 ### Request flow
 
-1. `components/chat.tsx` — Client component using `HttpAgent` from `@ag-ui/client`. Subscribes to AG-UI events (`onTextMessageContentEvent`, `onToolCallStartEvent`, etc.) and renders streaming text updates. Sends user messages via `agent.addMessage()` + `agent.runAgent()`, which POSTs to `/api/agent`. Parses `<tips>` tags from LLM responses via `extractTips()` and renders them as `TipsCard` alongside `WeatherCard` for weather data.
+1. `components/chat.tsx` — Client component using `HttpAgent` from `@ag-ui/client`. Subscribes to AG-UI events (`onTextMessageContentEvent`, `onToolCallStartEvent`, `onCustomEvent` for A2UI) and renders streaming text updates. Sends user messages via `agent.addMessage()` + `agent.runAgent()`, which POSTs to `/api/agent`. Integrates A2UI renderer for declarative UI components (WeatherCard, TipsCard). Renders in event stream order: user message → A2UI surface → tool status → LLM text.
 
-2. `app/api/agent/route.ts` — Edge-adjacent Node.js API route. Receives `{ messages, tools }`, merges the built-in `weatherToolDefinition` with any client-provided tools, and streams AG-UI events as SSE (`text/event-stream`). Each event is emitted as `data: <JSON>\n\n`. Never sends `data: [DONE]` — the AG-UI client uses `RUN_FINISHED` + connection close to detect completion.
+2. `app/api/agent/route.ts` — Edge-adjacent Node.js API route. Receives `{ messages, tools }`, merges the built-in `weatherToolDefinition` with any client-provided tools (auto-converts simplified tool format to OpenAI Function Schema), and streams AG-UI/A2UI events as SSE (`text/event-stream`). Each event is emitted as `data: <JSON>\n\n`. Never sends `data: [DONE]` — the AG-UI client uses `RUN_FINISHED` + connection close to detect completion.
 
-3. `lib/agent.ts` — Core agent logic as an `AsyncGenerator<AguiEvent>`. Calls DeepSeek V4 with `stream: true`, maps SSE deltas to AG-UI events (`TEXT_MESSAGE_CONTENT` for text, `TOOL_CALL_START/ARGS/END` for tool calls). Runs a tool calling loop (max 3 rounds): executes tools locally, appends results to messages, and re-invokes the LLM. On error, emits `RUN_ERROR` and stops (no `RUN_FINISHED` after error).
+3. `lib/agent.ts` — Core agent logic as an `AsyncGenerator<AguiEvent>`. Calls DeepSeek V4 with `stream: true`, maps SSE deltas to AG-UI events (`TEXT_MESSAGE_CONTENT` for text, `TOOL_CALL_START/ARGS/END` for tool calls). Runs a tool calling loop (max 3 rounds): executes tools locally, appends results to messages, and re-invokes the LLM. Generates A2UI events for weather data (createSurface, updateComponents, updateDataModel). On error, emits `RUN_ERROR` and stops (no `RUN_FINISHED` after error).
 
 4. `lib/deepseek.ts` — Minimal DeepSeek API client using the OpenAI SDK v4 with `baseURL: "https://api.deepseek.com"`. Do NOT append `/v1` to the base URL; the SDK handles path construction.
 
-5. `lib/tools.ts` — Weather tool definition (OpenAI function schema) + execution with dual-API fallback. Primary: Open-Meteo (geocoding → forecast, with retry for 5xx). Fallback: wttr.in (free, no API key, accepts city names directly). Falls back automatically when Open-Meteo is unavailable. Includes WMO weather code → Chinese description mapping.
+5. `lib/tools.ts` — Weather tool definition (simplified format: `{ name, description, parameters }`) + execution with dual-API fallback. Primary: Open-Meteo (geocoding → forecast, with retry for 5xx). Fallback: wttr.in (free, no API key, accepts city names directly). Falls back automatically when Open-Meteo is unavailable. Includes WMO weather code → Chinese description mapping.
 
 6. `components/weather-card.tsx` — Gradient weather card rendered when a message has `weatherData`. Styled per WMO weather code (sunny=orange, rain=blue, snow=ice-blue, etc.) with temperature, humidity, wind speed, and daily high/low.
 
 7. `components/tips-card.tsx` — Amber-themed card for LLM-generated travel advice. Triggered by `<tips>` tags in the LLM response text.
+
+8. `lib/a2ui-types.ts` — A2UI v0.9 protocol type definitions (A2UICreateSurface, A2UIUpdateComponents, A2UIUpdateDataModel, A2UIDeleteSurface).
+
+9. `lib/a2ui-catalog.ts` — A2UI Catalog registration, mapping component names to React renderers (WeatherCard, TipsCard, Column, Row, Text, Button).
+
+10. `lib/a2ui-renderer.tsx` — A2UI Surface renderer. Manages surface state (components, dataModel), resolves data bindings, and renders component trees. Includes `renderSurfaceSplit()` for selective component rendering.
+
+11. `components/a2ui-components.tsx` — A2UI component implementations (A2UIWeatherCard, A2UITipsCard) that read from DataModel paths.
 
 ### Key implementation details
 
 - **Thinking mode is disabled** (`thinking: { type: "disabled" }`) to avoid `reasoning_content` round-trip requirements in multi-turn conversations.
 - **Tool messages**: When sending tool results back to the LLM, `tool_call_id` must use the LLM's tool call ID (from `tool_calls[].id`), not the message's own UUID.
 - **Weather tool is always auto-merged** into the tools array on the server side — the client doesn't need to pass it explicitly, passing `tools: []` still gets weather support.
+- **Simplified tool format**: Tools use `{ name, description, parameters }` format. The route.ts automatically converts to OpenAI Function Schema before passing to the LLM.
+- **A2UI Surface structure**: Weather tool results create a Surface with Column → [WeatherCard, TipsCard]. Data is stored in DataModel at `/weather` path. Tips are extracted from LLM text and stored at `/tips` path.
+- **Rendering order**: Components render in event stream order: user message → A2UI surface (WeatherCard + TipsCard) → tool status → LLM text. TipsCard from A2UI surface renders with the surface, not after LLM text.
+- **Dual API fallback**: Open-Meteo is primary weather API. If it fails, automatically falls back to wttr.in (free, no API key).
 - **Environment**: Requires `DEEPSEEK_API_KEY` in `.env.local` (acquired from https://platform.deepseek.com).
 - **Tips system**: The system prompt instructs the LLM to wrap travel advice in `<tips>...</tips>` tags. The frontend `extractTips()` function (in `chat.tsx`) uses `indexOf`-based parsing — NOT regex — because DeepSeek's streaming can drop the final `>` of `</tips>`, making regex `/<tips>([\s\S]*?)<\/tips>/` fail. The parser only requires `<tips>` opening tag and `</tips` prefix to locate boundaries.
 - **Client-side tools**: `get_user_location` is a client-side tool — when the LLM calls it, the server emits `TOOL_CALL_RESULT` with `metadata: { clientTool: true }` and breaks the loop. The client executes the tool (browser geolocation → Nominatim reverse geocoding) and re-invokes `agent.runAgent()` with the result appended as a tool message. The `clientToolContinuationRef` flag prevents `sendMessage`'s finally block from prematurely setting `isStreaming: false`.

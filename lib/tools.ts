@@ -14,21 +14,18 @@ function wmoToText(code: number): string {
 }
 
 export const weatherToolDefinition = {
-  type: "function" as const,
-  function: {
-    name: "get_weather",
-    description:
-      "获取指定城市今天的实时天气情况，包含当前温度、体感温度、湿度、风速、天气描述，以及今日最高/最低气温预报",
-    parameters: {
-      type: "object" as const,
-      properties: {
-        city: {
-          type: "string",
-          description: "城市中文名称，例如：北京、上海、深圳、杭州、成都",
-        },
+  name: "get_weather",
+  description:
+    "获取指定城市今天的实时天气情况，包含当前温度、体感温度、湿度、风速、天气描述，以及今日最高/最低气温预报",
+  parameters: {
+    type: "object" as const,
+    properties: {
+      city: {
+        type: "string",
+        description: "城市中文名称，例如：北京、上海、深圳、杭州、成都",
       },
-      required: ["city"],
     },
+    required: ["city"],
   },
 };
 

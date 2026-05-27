@@ -1,11 +1,12 @@
 # ai-weather-assistant
 
-基于 **Next.js 15 + DeepSeek V4 + AG-UI Protocol** 的智能天气预报助手。支持自然语言查询天气、自动定位用户城市、流式实时回复，并以可视化卡片展示天气数据和出行建议。
+基于 **Next.js 15 + DeepSeek V4 + AG-UI/A2UI Protocol** 的智能天气预报助手。支持自然语言查询天气、自动定位用户城市、流式实时回复，并以可视化卡片展示天气数据和出行建议。
 
 ## 功能特性
 
 - **自然语言交互** — 输入「今天天气怎么样？」即可查询，无需指定城市时自动获取定位
 - **流式实时回复** — 基于 AG-UI Protocol + SSE，逐字流式输出，体验流畅
+- **A2UI 声明式 UI** — 通过 A2UI v0.9 协议动态创建 Surface/Component，实现灵活的卡片渲染
 - **可视化天气卡片** — 温度、湿度、风速、天气状况以渐变卡片呈现，配色随天气变化
 - **出行建议卡片** — AI 生成的穿衣/带伞/防晒等建议以独立卡片展示
 - **双 API 容灾** — Open-Meteo 不可用时自动切换 wttr.in 备用 API
@@ -16,7 +17,7 @@
 |------|------|
 | 框架 | Next.js 15 (App Router) + React 19 |
 | LLM | DeepSeek V4 API（OpenAI 兼容） |
-| 流式协议 | AG-UI Protocol over SSE |
+| 流式协议 | AG-UI Protocol + A2UI v0.9 over SSE |
 | 天气数据 | Open-Meteo（主）+ wttr.in（备） |
 | 定位 | Browser Geolocation + Nominatim 逆地理编码 |
 | 样式 | Tailwind CSS v4 |
@@ -41,17 +42,21 @@ npm run dev
 
 ```
 app/
-  api/agent/route.ts    # AG-UI HTTP Endpoint — 接收消息，流式返回 AG-UI 事件
+  api/agent/route.ts    # AG-UI HTTP Endpoint — 接收消息，流式返回 AG-UI/A2UI 事件
   page.tsx              # 主页
   layout.tsx            # 根布局
 components/
-  chat.tsx              # 聊天 UI — AG-UI 事件订阅、流式渲染、tips 解析
+  chat.tsx              # 聊天 UI — AG-UI 事件订阅、A2UI 集成、流式渲染
   weather-card.tsx      # 天气数据卡片（渐变背景，配色随天气变化）
   tips-card.tsx         # 出行建议卡片（琥珀色主题）
+  a2ui-components.tsx   # A2UI 组件实现（A2UIWeatherCard、A2UITipsCard）
 lib/
-  agent.ts              # Agent 核心逻辑 — DeepSeek 流式调用 + 工具循环（最多 3 轮）
+  agent.ts              # Agent 核心逻辑 — DeepSeek 流式调用 + 工具循环（最多 3 轮）+ A2UI 事件生成
   deepseek.ts           # DeepSeek API 客户端（基于 OpenAI SDK）
   tools.ts              # 天气工具定义 + 双 API 执行（Open-Meteo → wttr.in fallback）
+  a2ui-types.ts         # A2UI v0.9 协议类型定义
+  a2ui-catalog.ts       # A2UI Catalog 注册（WeatherCard/TipsCard 渲染器）
+  a2ui-renderer.tsx     # A2UI Surface 渲染器（管理组件树和 DataModel）
 ```
 
 ## 架构概览
@@ -61,8 +66,9 @@ lib/
 ┌──────────────────────────┐              ┌──────────────────┐
 │  Chat UI                 │  SSE 请求    │  Agent (AsyncGen) │
 │  ├─ HttpAgent            │ ──────────►  │  DeepSeek V4 API  │
-│  ├─ WeatherCard          │ ◄─────────── │  Weather Tool     │
-│  └─ TipsCard             │  AG-UI 事件  └──────────────────┘
+│  ├─ A2UIRenderer         │ ◄─────────── │  Weather Tool     │
+│  ├─ WeatherCard          │  AG-UI/A2UI  │  A2UI Events      │
+│  └─ TipsCard             │  事件流      └──────────────────┘
 │                          │                      │
 │  客户端工具执行：          │                      ▼
 │  get_user_location       │            Open-Meteo / wttr.in
@@ -71,16 +77,19 @@ lib/
 └──────────────────────────┘
 ```
 
-**请求流程（未指定城市时）**：用户输入 → `HttpAgent` POST 到 `/api/agent` → LLM 调用 `get_user_location`（客户端工具）→ 服务端中断流，前端执行浏览器定位 + Nominatim 逆地理编码获取城市名 → 前端携带定位结果再次请求 `/api/agent` → LLM 调用 `get_weather` → 服务端查询天气 API → 结果回传 LLM → 生成自然语言回复（含天气卡片 + 出行建议卡片）→ AG-UI 事件流式返回前端 → 逐字渲染。
+**请求流程（未指定城市时）**：用户输入 → `HttpAgent` POST 到 `/api/agent` → LLM 调用 `get_user_location`（客户端工具）→ 服务端中断流，前端执行浏览器定位 + Nominatim 逆地理编码获取城市名 → 前端携带定位结果再次请求 `/api/agent` → LLM 调用 `get_weather` → 服务端查询天气 API → 创建 A2UI Surface (WeatherCard + TipsCard) → 结果回传 LLM → 生成自然语言回复 → 提取 `<tips>` 更新 A2UI DataModel → AG-UI/A2UI 事件流式返回前端 → 按事件流顺序渲染。
 
 **请求流程（已指定城市时）**：跳过定位环节，LLM 直接调用 `get_weather` 查询天气。
+
+**A2UI 事件流顺序**：
+1. `a2ui_create_surface` — 创建 Surface
+2. `a2ui_update_components` — 定义组件树（Column → [WeatherCard, TipsCard]）
+3. `a2ui_update_data_model` — 更新天气数据到 `/weather`
+4. `TEXT_MESSAGE_*` — LLM 流式回复
+5. `a2ui_update_data_model` — 更新出行建议到 `/tips`（如有）
 
 详细设计文档见 [REQUIREMENTS.md](./REQUIREMENTS.md)。
 
 ## 需求设计
 
 [REQUIREMENTS](./REQUIREMENTS.md)
-
-## TODO
-
-- [ ] A2UI 接入，动态切换卡片

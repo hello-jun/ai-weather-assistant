@@ -15,9 +15,10 @@
 | **前端框架** | Next.js 15 (App Router) | React 全栈框架 |
 | **语言** | TypeScript | 全栈类型安全 |
 | **AG-UI SDK** | `@ag-ui/core` v0.0.53 + `@ag-ui/client` v0.0.53 | AG-UI 协议的 TypeScript 官方 SDK |
-| **流式传输** | SSE (Server-Sent Events) | AG-UI 事件通过 `data:` 行推送到前端 |
+| **A2UI 协议** | v0.9 | AG-UI 的扩展协议，支持 Surface/Component/DataModel 声明式 UI |
+| **流式传输** | SSE (Server-Sent Events) | AG-UI/A2UI 事件通过 `data:` 行推送到前端 |
 | **大模型 API** | DeepSeek V4 API (`deepseek-v4-pro`) | OpenAI 兼容接口，支持 Streaming + Function Calling |
-| **天气数据** | Open-Meteo API（免费，无需 Key） | 地理编码 + 天气预报 |
+| **天气数据** | Open-Meteo API（主）+ wttr.in（备） | 双 API 容灾，主 API 失败自动切换备用 |
 | **样式** | Tailwind CSS v4 | 快速构建现代 UI |
 
 ---
@@ -105,23 +106,27 @@ for await (const chunk of stream) {
          └────────────────────────────┘
 ```
 
-### 4.2 AG-UI 事件流（一次带 Function Calling 的对话）
+### 4.2 AG-UI/A2UI 事件流（一次带 Function Calling 的对话）
 
 ```
 时间 ──────────────────────────────────────────────────────►
 
 服务端 → 前端 (SSE 事件流):
   RUN_STARTED                    ← 运行开始
-  TEXT_MESSAGE_START             ← AI 开始回复
-  TEXT_MESSAGE_CONTENT × N       ← 流式文本 "好的，我先来帮你查一下..."
+  TEXT_MESSAGE_START             ← AI 开始回复（工具调用前的说明文本）
+  TEXT_MESSAGE_CONTENT × N       ← 流式文本 "好的，我来帮你查一下..."
   TEXT_MESSAGE_END
   TOOL_CALL_START                ← 检测到工具调用
   TOOL_CALL_ARGS                 ← 工具参数 {"city":"北京"}
   TOOL_CALL_END
   TOOL_CALL_RESULT               ← 工具执行结果（天气数据）
-  TEXT_MESSAGE_START             ← 基于结果生成自然语言
+  CUSTOM a2ui_create_surface     ← A2UI: 创建 Surface
+  CUSTOM a2ui_update_components  ← A2UI: 定义组件树 (WeatherCard + TipsCard)
+  CUSTOM a2ui_update_data_model  ← A2UI: 更新天气数据到 /weather
+  TEXT_MESSAGE_START             ← AI 基于结果生成自然语言
   TEXT_MESSAGE_CONTENT × N       ← 流式输出 "北京今天天气晴朗..."
   TEXT_MESSAGE_END
+  CUSTOM a2ui_update_data_model  ← A2UI: 更新出行建议到 /tips（如有）
   RUN_FINISHED                   ← 运行结束
 ```
 
@@ -130,7 +135,7 @@ for await (const chunk of stream) {
 ## 5. 目录结构
 
 ```
-ag-ui-test/
+ai-weather-assistant/
 ├── app/
 │   ├── layout.tsx              # 根布局（Tailwind 全局样式）
 │   ├── page.tsx                # 主页（聊天界面容器）
@@ -140,10 +145,16 @@ ag-ui-test/
 │           └── route.ts        # AG-UI HTTP Endpoint（核心后端）
 ├── lib/
 │   ├── deepseek.ts             # DeepSeek V4 客户端封装
-│   ├── tools.ts                # 天气工具定义 + Open-Meteo 实现
-│   └── agent.ts                # AG-UI Agent 核心逻辑（AsyncGenerator）
+│   ├── tools.ts                # 天气工具定义 + 双 API 执行（Open-Meteo → wttr.in fallback）
+│   ├── agent.ts                # AG-UI/A2UI Agent 核心逻辑（AsyncGenerator）
+│   ├── a2ui-types.ts           # A2UI v0.9 协议类型定义
+│   ├── a2ui-catalog.ts         # A2UI Catalog 注册（WeatherCard/TipsCard 渲染器）
+│   └── a2ui-renderer.tsx       # A2UI Surface 渲染器
 ├── components/
-│   └── chat.tsx                # 聊天 UI 组件（含流式渲染逻辑）
+│   ├── chat.tsx                # 聊天 UI 组件（含流式渲染、A2UI 集成）
+│   ├── weather-card.tsx        # 天气数据卡片（渐变背景，配色随天气变化）
+│   ├── tips-card.tsx           # 出行建议卡片（琥珀色主题）
+│   └── a2ui-components.tsx     # A2UI 组件实现（A2UIWeatherCard、A2UITipsCard）
 ├── .env.local                  # 环境变量（DeepSeek API Key）
 ├── package.json
 ├── tsconfig.json
@@ -172,28 +183,32 @@ export const deepseek = new OpenAI({
 
 ### 6.2 天气工具 (`lib/tools.ts`)
 
-**工具定义**（符合 OpenAI Function Schema）：
+**工具定义**（简化格式，route.ts 会自动转换为 OpenAI Function Schema）：
 ```typescript
 export const weatherToolDefinition = {
-  type: "function" as const,
-  function: {
-    name: "get_weather",
-    description: "获取指定城市今天的实时天气情况",
-    parameters: {
-      type: "object" as const,
-      properties: {
-        city: { type: "string", description: "城市中文名称，例如：北京、上海" },
-      },
-      required: ["city"],
+  name: "get_weather",
+  description: "获取指定城市今天的实时天气情况，包含当前温度、体感温度、湿度、风速、天气描述，以及今日最高/最低气温预报",
+  parameters: {
+    type: "object" as const,
+    properties: {
+      city: { type: "string", description: "城市中文名称，例如：北京、上海、深圳、杭州、成都" },
     },
+    required: ["city"],
   },
 };
 ```
 
-**工具实现流程**：
+**工具实现流程**（双 API 容灾）：
 
-1. **地理编码** → `GET https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=zh`
-2. **获取天气** → `GET https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=...&daily=...&forecast_days=1&timezone=auto`
+1. **主 API - Open-Meteo**：
+   - 地理编码 → `GET https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=zh`
+   - 获取天气 → `GET https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=...&daily=...&forecast_days=1&timezone=auto`
+   - 自动重试 5xx 错误（最多 2 次）
+
+2. **备用 API - wttr.in**（Open-Meteo 失败时自动切换）：
+   - `GET https://wttr.in/{city}?format=j1`
+   - 免费，无需 API Key，支持中文城市名
+
 3. **WMO 天气代码映射** → 将数字 weather_code 转为中文描述（如 0→"晴朗"、61→"小到中雨"）
 
 ### 6.3 Agent 核心逻辑 (`lib/agent.ts`)
@@ -256,7 +271,7 @@ export async function POST(req: NextRequest) {
 
 ### 6.5 前端聊天组件 (`components/chat.tsx`)
 
-使用 `HttpAgent` 连接后端 API，通过 subscriber 模式处理 AG-UI 事件：
+使用 `HttpAgent` 连接后端 API，通过 subscriber 模式处理 AG-UI 事件，并集成 A2UI 渲染：
 
 ```typescript
 const agent = new HttpAgent({ url: "/api/agent" });
@@ -271,6 +286,10 @@ agent.subscribe({
   onToolCallStartEvent({ event }) {
     // 显示工具调用状态指示器
   },
+  onCustomEvent({ event }) {
+    // 处理 A2UI 事件: a2ui_create_surface, a2ui_update_components, a2ui_update_data_model
+    a2uiRenderer.handleEvent(event);
+  },
   onRunErrorEvent({ event }) {
     // 显示错误信息
     errorHandledRef.current = true;
@@ -282,11 +301,23 @@ agent.addMessage({ id: uuid(), role: "user", content: text });
 await agent.runAgent();
 ```
 
+**渲染顺序**（按事件流自然顺序）：
+1. 用户消息
+2. A2UI Surface（WeatherCard + TipsCard）
+3. 工具状态指示器
+4. LLM 文本内容
+
+**A2UI 集成**：
+- `a2ui-renderer.tsx` 管理 Surface 状态和组件渲染
+- `a2ui-catalog.ts` 注册组件渲染器（WeatherCard、TipsCard）
+- A2UI TipsCard 从 DataModel 的 `/tips` 路径读取数据
+- 当 A2UI Surface 存在时，LLM 文本中的 `<tips>` 标签不再重复渲染
+
 ---
 
-## 7. DeepSeek SSE → AG-UI 事件映射表
+## 7. DeepSeek SSE → AG-UI/A2UI 事件映射表
 
-| DeepSeek SSE chunk | AG-UI Event |
+| DeepSeek SSE chunk | AG-UI/A2UI Event |
 |---|---|
 | 开始流式 | `RUN_STARTED` |
 | `delta.content` 首次出现 | `TEXT_MESSAGE_START` |
@@ -295,7 +326,9 @@ await agent.runAgent();
 | `delta.tool_calls[0].function.arguments` | `TOOL_CALL_ARGS` (增量) |
 | `finish_reason` = "tool_calls" | `TOOL_CALL_END` |
 | 工具函数执行完毕 | `TOOL_CALL_RESULT` |
+| 天气工具返回结果 | `CUSTOM a2ui_create_surface` + `a2ui_update_components` + `a2ui_update_data_model` |
 | 二次调用 LLM 流式输出 | `TEXT_MESSAGE_START` → `TEXT_MESSAGE_CONTENT` × N → `TEXT_MESSAGE_END` |
+| LLM 文本包含 `<tips>` | `CUSTOM a2ui_update_data_model` (path: `/tips`) |
 | `finish_reason` = "stop" | `TEXT_MESSAGE_END` |
 | 流结束（无错误） | `RUN_FINISHED` |
 | 异常 | `RUN_ERROR`（之后不发送 RUN_FINISHED） |
@@ -323,15 +356,25 @@ await agent.runAgent();
          ↓ Open-Meteo Forecast: 获取当前温度、湿度、风速、天气代码
          ↓ SSE → TOOL_CALL_RESULT
          ↓
-步骤 7: 将工具结果追加到 messages，二次调用 DeepSeek V4
+步骤 7: 服务端创建 A2UI Surface 并更新组件和数据
+         ↓ SSE → CUSTOM a2ui_create_surface
+         ↓ SSE → CUSTOM a2ui_update_components (WeatherCard + TipsCard)
+         ↓ SSE → CUSTOM a2ui_update_data_model (/weather)
+         ↓
+步骤 8: 将工具结果追加到 messages，二次调用 DeepSeek V4
          ↓ SSE → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT × N → TEXT_MESSAGE_END
          ↓ 逐字流式输出 "今天北京天气晴朗，当前温度22.5°C..."
          ↓
-步骤 8: SSE → RUN_FINISHED
+步骤 9: 服务端提取 <tips> 标签内容，更新 A2UI DataModel
+         ↓ SSE → CUSTOM a2ui_update_data_model (/tips)
          ↓
-步骤 9: 前端 chat.tsx 每收到 TEXT_MESSAGE_CONTENT
-        即追加 delta 到 AI 消息的 content 末尾
-        → React setState → UI re-render → 用户看到逐字输出效果
+步骤 10: SSE → RUN_FINISHED
+         ↓
+步骤 11: 前端 chat.tsx 按事件流顺序渲染：
+          - 用户消息
+          - A2UI Surface (WeatherCard + TipsCard)
+          - 工具状态指示器
+          - LLM 文本内容
 ```
 
 ---
@@ -379,7 +422,10 @@ npm run dev
 | 3 | 输入「今天北京天气怎么样？」→ 回复今日真实天气 | 手动验证 |
 | 4 | 输入「上海天气如何？」→ 回复对应城市天气 | 手动验证 |
 | 5 | 多轮对话中继续询问其他城市天气，上下文保持正确 | 手动验证 |
-| 6 | API 异常时显示错误提示，不崩溃 | 断网测试 |
+| 6 | 天气查询后显示 WeatherCard 渐变卡片（配色随天气变化） | 手动验证 |
+| 7 | 出行建议显示在 TipsCard 琥珀色卡片中 | 手动验证 |
+| 8 | Open-Meteo 不可用时自动切换 wttr.in 备用 API | 断开 Open-Meteo 测试 |
+| 9 | API 异常时显示错误提示，不崩溃 | 断网测试 |
 
 ---
 

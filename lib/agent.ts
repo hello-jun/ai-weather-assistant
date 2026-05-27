@@ -49,12 +49,9 @@ interface AguiMessage {
 }
 
 interface AguiToolDef {
-  type: "function";
-  function: {
-    name: string;
-    description: string;
-    parameters: Record<string, unknown>;
-  };
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
 }
 
 interface AguiEvent {
@@ -107,14 +104,16 @@ function toOpenAIMessages(messages: AguiMessage[]): OpenAI.Chat.Completions.Chat
 /** Convert AG-UI tool definitions to OpenAI tool format */
 function toOpenAITools(tools?: AguiToolDef[]): OpenAI.Chat.Completions.ChatCompletionTool[] | undefined {
   if (!tools?.length) return undefined;
-  return tools.map((t) => ({
-    type: t.type,
-    function: {
-      name: t.function.name,
-      description: t.function.description,
-      parameters: t.function.parameters,
-    },
-  }));
+  return tools
+    .filter((t) => t?.name)
+    .map((t) => ({
+      type: "function" as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }));
 }
 
 /** Execute a tool call locally */
