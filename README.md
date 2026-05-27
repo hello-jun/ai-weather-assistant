@@ -9,6 +9,7 @@
 - **A2UI 声明式 UI** — 通过 A2UI v0.9 协议动态创建 Surface/Component，实现灵活的卡片渲染
 - **可视化天气卡片** — 温度、湿度、风速、天气状况以渐变卡片呈现，配色随天气变化
 - **出行建议卡片** — AI 生成的穿衣/带伞/防晒等建议以独立卡片展示
+- **智能城市纠错** — 输入无效城市时，通过 AG-UI 中断协议显示城市输入卡片，等待用户输入正确城市后继续查询
 - **双 API 容灾** — Open-Meteo 不可用时自动切换 wttr.in 备用 API
 
 ## 技术栈
@@ -46,16 +47,17 @@ app/
   page.tsx              # 主页
   layout.tsx            # 根布局
 components/
-  chat.tsx              # 聊天 UI — AG-UI 事件订阅、A2UI 集成、流式渲染
+  chat.tsx              # 聊天 UI — AG-UI 事件订阅、A2UI 集成、中断处理、流式渲染
   weather-card.tsx      # 天气数据卡片（渐变背景，配色随天气变化）
   tips-card.tsx         # 出行建议卡片（琥珀色主题）
-  a2ui-components.tsx   # A2UI 组件实现（A2UIWeatherCard、A2UITipsCard）
+  city-input-card.tsx   # 城市输入卡片（AG-UI 中断时显示，输入框+确认按钮）
+  a2ui-components.tsx   # A2UI 组件实现（A2UIWeatherCard、A2UITipsCard、A2UICityInputCard）
 lib/
-  agent.ts              # Agent 核心逻辑 — DeepSeek 流式调用 + 工具循环（最多 3 轮）+ A2UI 事件生成
+  agent.ts              # Agent 核心逻辑 — DeepSeek 流式调用 + 工具循环 + AG-UI 中断/恢复
   deepseek.ts           # DeepSeek API 客户端（基于 OpenAI SDK）
   tools.ts              # 天气工具定义 + 双 API 执行（Open-Meteo → wttr.in fallback）
   a2ui-types.ts         # A2UI v0.9 协议类型定义
-  a2ui-catalog.ts       # A2UI Catalog 注册（WeatherCard/TipsCard 渲染器）
+  a2ui-catalog.ts       # A2UI Catalog 注册（WeatherCard/TipsCard/CityInputCard 渲染器）
   a2ui-renderer.tsx     # A2UI Surface 渲染器（管理组件树和 DataModel）
 ```
 
@@ -80,6 +82,8 @@ lib/
 **请求流程（未指定城市时）**：用户输入 → `HttpAgent` POST 到 `/api/agent` → LLM 调用 `get_user_location`（客户端工具）→ 服务端中断流，前端执行浏览器定位 + Nominatim 逆地理编码获取城市名 → 前端携带定位结果再次请求 `/api/agent` → LLM 调用 `get_weather` → 服务端查询天气 API → 创建 A2UI Surface (WeatherCard + TipsCard) → 结果回传 LLM → 生成自然语言回复 → 提取 `<tips>` 更新 A2UI DataModel → AG-UI/A2UI 事件流式返回前端 → 按事件流顺序渲染。
 
 **请求流程（已指定城市时）**：跳过定位环节，LLM 直接调用 `get_weather` 查询天气。
+
+**请求流程（城市无效时 — AG-UI 中断）**：用户输入无效城市 → LLM 调用 `get_weather` → 工具返回错误 → Agent 发出 AG-UI 中断（`RUN_FINISHED { outcome: { type: "interrupt" } }`）→ 前端渲染 `CityInputCard` → 用户输入正确城市并确认 → 前端发送 resume 请求 → Agent 用修正后的城市重新查询 → 返回天气结果。
 
 **A2UI 事件流顺序**：
 1. `a2ui_create_surface` — 创建 Surface

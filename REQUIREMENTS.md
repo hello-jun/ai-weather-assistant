@@ -130,6 +130,41 @@ for await (const chunk of stream) {
   RUN_FINISHED                   ← 运行结束
 ```
 
+### 4.3 AG-UI 中断流程（城市无效时）
+
+当用户输入无效城市时，系统通过 AG-UI Interrupt 协议暂停运行，等待用户输入正确城市：
+
+```
+时间 ──────────────────────────────────────────────────────►
+
+Run 1（中断）:
+  RUN_STARTED
+  TOOL_CALL_START                ← LLM 调用 get_weather("嘎嘎嘎")
+  TOOL_CALL_ARGS
+  TOOL_CALL_END
+  TOOL_CALL_RESULT               ← 工具返回 { error: "..." }
+  CUSTOM interrupt               ← 中断事件（含 threadId, runId）
+  RUN_FINISHED { outcome: { type: "interrupt", interrupts: [...] } }
+                                 ← 运行暂停，等待用户输入
+
+用户在 CityInputCard 中输入 "北京" 并点击确认
+
+Run 2（恢复）:
+  POST /api/agent { resume: [{ interruptId, status: "resolved", payload: { city: "北京" } }] }
+  RUN_STARTED
+  TOOL_CALL_START                ← 用修正后的城市重新查询
+  TOOL_CALL_ARGS
+  TOOL_CALL_END
+  TOOL_CALL_RESULT               ← 天气数据
+  CUSTOM a2ui_create_surface
+  CUSTOM a2ui_update_components
+  CUSTOM a2ui_update_data_model
+  TEXT_MESSAGE_START             ← AI 生成回复
+  TEXT_MESSAGE_CONTENT × N
+  TEXT_MESSAGE_END
+  RUN_FINISHED { outcome: { type: "success" } }
+```
+
 ---
 
 ## 5. 目录结构
@@ -151,10 +186,11 @@ ai-weather-assistant/
 │   ├── a2ui-catalog.ts         # A2UI Catalog 注册（WeatherCard/TipsCard 渲染器）
 │   └── a2ui-renderer.tsx       # A2UI Surface 渲染器
 ├── components/
-│   ├── chat.tsx                # 聊天 UI 组件（含流式渲染、A2UI 集成）
+│   ├── chat.tsx                # 聊天 UI 组件（含流式渲染、A2UI 集成、中断处理）
 │   ├── weather-card.tsx        # 天气数据卡片（渐变背景，配色随天气变化）
 │   ├── tips-card.tsx           # 出行建议卡片（琥珀色主题）
-│   └── a2ui-components.tsx     # A2UI 组件实现（A2UIWeatherCard、A2UITipsCard）
+│   ├── city-input-card.tsx     # 城市输入卡片（AG-UI 中断时显示，输入框+确认按钮）
+│   └── a2ui-components.tsx     # A2UI 组件实现（A2UIWeatherCard、A2UITipsCard、A2UICityInputCard）
 ├── .env.local                  # 环境变量（DeepSeek API Key）
 ├── package.json
 ├── tsconfig.json
@@ -216,17 +252,23 @@ export const weatherToolDefinition = {
 核心是一个 **AsyncGenerator 函数**，逐一产出 AG-UI Event：
 
 ```typescript
-async function* runAgent(messages, tools): AsyncGenerator<AguiEvent> {
+async function* runAgent(messages, tools, options?): AsyncGenerator<AguiEvent> {
   yield { type: "RUN_STARTED", runId, threadId };
+  let interrupted = false;
   try {
-    for await (const event of runConversation(...)) {
+    for await (const event of runConversation({ ..., resume: options?.resume })) {
+      if (event.type === "RUN_FINISHED" && event.outcome?.type === "interrupt") {
+        interrupted = true;
+      }
       yield event;
     }
   } catch (err) {
     yield { type: "RUN_ERROR", message: err.message };
-    return; // 不发送 RUN_FINISHED
+    return;
   }
-  yield { type: "RUN_FINISHED", runId, threadId };
+  if (!interrupted) {
+    yield { type: "RUN_FINISHED", runId, threadId };
+  }
 }
 ```
 
@@ -238,21 +280,33 @@ async function* runAgent(messages, tools): AsyncGenerator<AguiEvent> {
 5. 将结果追加到消息列表，二次调用 LLM 生成最终回复
 6. 无工具调用 → 结束
 
+**AG-UI 中断机制**：
+- 当 `get_weather` 返回错误或无效数据时，发出 `CUSTOM interrupt` + `RUN_FINISHED { outcome: { type: "interrupt" } }`
+- 客户端收到中断后渲染 `CityInputCard`，用户输入正确城市
+- 客户端发送 `resume` 数据，Agent 用修正后的城市重新查询
+
+**Resume 处理**：
+- `runAgent` 接收 `options.resume` 参数
+- 检测到 resume 时，直接执行 `get_weather` 并生成工具事件
+- 将工具结果追加到消息列表，继续正常 LLM 对话流程
+
 **关键注意事项**：
 - 工具消息包含 `id`（消息 UUID）和 `toolCallId`（LLM 工具调用 ID），发送给 API 时 `tool_call_id` 必须用 `toolCallId` 而不能用 `id`
 - `RUN_ERROR` 之后不能再发送 `RUN_FINISHED`
+- 中断时已发送 `RUN_FINISHED`，`runAgent` 结束时不再重复发送
 - 系统消息只添加一次，避免多轮工具调用中重复
 
 ### 6.4 API Route (`app/api/agent/route.ts`)
 
 ```typescript
 export async function POST(req: NextRequest) {
-  const { messages, tools } = await req.json();
+  const { messages, tools, threadId, resume } = await req.json();
+  const mergedTools = [weatherToolDefinition, ...tools];
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
-      for await (const event of runAgent(messages, tools)) {
+      for await (const event of runAgent(messages, mergedTools, { threadId, resume })) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
       }
       controller.close();
@@ -268,6 +322,7 @@ export async function POST(req: NextRequest) {
 注意：
 - 返回 `text/event-stream`，每个事件一行 `data: <JSON>\n\n`
 - **不要**发送 `data: [DONE]`——这是 OpenAI 的 SSE 终止标记，AG-UI 客户端会用 `RUN_FINISHED` 事件 + 连接关闭来判断流结束
+- `threadId` 和 `resume` 用于 AG-UI 中断恢复流程
 
 ### 6.5 前端聊天组件 (`components/chat.tsx`)
 
@@ -288,6 +343,7 @@ agent.subscribe({
   },
   onCustomEvent({ event }) {
     // 处理 A2UI 事件: a2ui_create_surface, a2ui_update_components, a2ui_update_data_model
+    // 处理中断事件: interrupt（存储中断数据，渲染 CityInputCard）
     a2uiRenderer.handleEvent(event);
   },
   onRunErrorEvent({ event }) {
@@ -305,13 +361,20 @@ await agent.runAgent();
 1. 用户消息
 2. A2UI Surface（WeatherCard + TipsCard）
 3. 工具状态指示器
-4. LLM 文本内容
+4. CityInputCard（仅在中断时显示）
+5. LLM 文本内容
 
 **A2UI 集成**：
 - `a2ui-renderer.tsx` 管理 Surface 状态和组件渲染
-- `a2ui-catalog.ts` 注册组件渲染器（WeatherCard、TipsCard）
+- `a2ui-catalog.ts` 注册组件渲染器（WeatherCard、TipsCard、CityInputCard）
 - A2UI TipsCard 从 DataModel 的 `/tips` 路径读取数据
 - 当 A2UI Surface 存在时，LLM 文本中的 `<tips>` 标签不再重复渲染
+
+**AG-UI 中断处理**：
+- 当收到 `CUSTOM interrupt` 事件时，存储中断数据到 `pendingInterrupt` 状态
+- 在消息列表中渲染 `CityInputCard` 组件
+- 用户输入城市并点击确认后，通过 `fetch` 发送 resume 请求到 `/api/agent`
+- 处理 resume 响应的 SSE 事件，更新天气数据和 LLM 文本
 
 ---
 
@@ -326,11 +389,12 @@ await agent.runAgent();
 | `delta.tool_calls[0].function.arguments` | `TOOL_CALL_ARGS` (增量) |
 | `finish_reason` = "tool_calls" | `TOOL_CALL_END` |
 | 工具函数执行完毕 | `TOOL_CALL_RESULT` |
-| 天气工具返回结果 | `CUSTOM a2ui_create_surface` + `a2ui_update_components` + `a2ui_update_data_model` |
+| 天气工具返回成功结果 | `CUSTOM a2ui_create_surface` + `a2ui_update_components` + `a2ui_update_data_model` |
+| 天气工具返回错误/无效数据 | `CUSTOM interrupt` + `RUN_FINISHED { outcome: { type: "interrupt" } }` |
 | 二次调用 LLM 流式输出 | `TEXT_MESSAGE_START` → `TEXT_MESSAGE_CONTENT` × N → `TEXT_MESSAGE_END` |
 | LLM 文本包含 `<tips>` | `CUSTOM a2ui_update_data_model` (path: `/tips`) |
 | `finish_reason` = "stop" | `TEXT_MESSAGE_END` |
-| 流结束（无错误） | `RUN_FINISHED` |
+| 流结束（无错误、无中断） | `RUN_FINISHED` |
 | 异常 | `RUN_ERROR`（之后不发送 RUN_FINISHED） |
 
 ---
@@ -375,6 +439,40 @@ await agent.runAgent();
           - A2UI Surface (WeatherCard + TipsCard)
           - 工具状态指示器
           - LLM 文本内容
+```
+
+### 8.2 城市无效时的中断流程
+
+```
+步骤 1: 用户输入「今天嘎嘎嘎的天气怎么样？」，回车发送
+         ↓
+步骤 2: chat.tsx 创建用户消息，调用 agent.addMessage() + agent.runAgent()
+         ↓
+步骤 3: LLM 调用 get_weather("嘎嘎嘎")，工具返回 { error: "..." }
+         ↓
+步骤 4: Agent 检测到天气错误，发出中断事件
+         ↓ SSE → CUSTOM interrupt { id, reason: "input_required", message, threadId, runId }
+         ↓ SSE → RUN_FINISHED { outcome: { type: "interrupt", interrupts: [...] } }
+         ↓
+步骤 5: 前端 chat.tsx 检测到 interrupt 事件，设置 pendingInterrupt 状态
+         ↓
+步骤 6: 渲染 CityInputCard 组件（输入框 + 确认按钮）
+         ↓
+步骤 7: 用户输入「北京」，点击确认
+         ↓
+步骤 8: handleCitySubmit 发送 resume 请求
+         ↓ POST /api/agent { messages, tools, threadId, resume: [{ interruptId, status: "resolved", payload: { city: "北京" } }] }
+         ↓
+步骤 9: Agent 检测到 resume，用修正后的城市重新执行 get_weather("北京")
+         ↓ SSE → TOOL_CALL_START / TOOL_CALL_ARGS / TOOL_CALL_END / TOOL_CALL_RESULT
+         ↓ SSE → CUSTOM a2ui_create_surface + a2ui_update_components + a2ui_update_data_model
+         ↓
+步骤 10: LLM 基于天气数据生成回复
+          ↓ SSE → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT × N → TEXT_MESSAGE_END
+          ↓
+步骤 11: SSE → RUN_FINISHED { outcome: { type: "success" } }
+          ↓
+步骤 12: 前端渲染天气卡片和 LLM 回复
 ```
 
 ---
