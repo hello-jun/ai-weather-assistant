@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { HttpAgent } from "@ag-ui/client";
 import { WeatherCard } from "./weather-card";
 import { TipsCard } from "./tips-card";
+import { CityInputCard } from "./city-input-card";
 import { a2uiRenderer } from "@/lib/a2ui-renderer";
 import { weatherCatalogRegistry } from "./a2ui-components";
 import type { WeatherResult } from "@/lib/tools";
@@ -17,6 +18,14 @@ interface ChatMessage {
   weatherData?: WeatherResult;
   tips?: string[];
   a2uiSurfaceId?: string;
+}
+
+interface PendingInterrupt {
+  interruptId: string;
+  threadId: string;
+  runId: string;
+  message?: string;
+  toolCallId?: string;
 }
 
 /** Extract <tips> content from LLM text, returning [cleanText, tips[]] */
@@ -42,12 +51,15 @@ export function ChatApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
+  const [pendingInterrupt, setPendingInterrupt] = useState<PendingInterrupt | null>(null);
   const [, setRenderTick] = useState(0);
   const agentRef = useRef<HttpAgent | null>(null);
   const pendingContentRef = useRef("");
   const pendingMsgIdRef = useRef("");
   const errorHandledRef = useRef(false);
   const clientToolContinuationRef = useRef(false);
+  const threadIdRef = useRef<string>("");
+  const runIdRef = useRef<string>("");
 
   // Client-side tool definitions (AG-UI format: { name, description, parameters })
   const CLIENT_TOOLS = [
@@ -163,6 +175,16 @@ export function ChatApp() {
         } else if (name === "a2ui_delete_surface") {
           a2uiRenderer.deleteSurface(value.surfaceId as string);
           setRenderTick((t) => t + 1);
+        } else if (name === "interrupt") {
+          // AG-UI interrupt detected — store interrupt data for city input
+          const interruptData = value as unknown as { id: string; threadId: string; runId: string; message?: string; toolCallId?: string };
+          setPendingInterrupt({
+            interruptId: interruptData.id,
+            threadId: interruptData.threadId,
+            runId: interruptData.runId,
+            message: interruptData.message,
+            toolCallId: interruptData.toolCallId,
+          });
         }
       },
     });
@@ -325,6 +347,177 @@ export function ChatApp() {
     [isRunning]
   );
 
+  const handleCitySubmit = useCallback(
+    async (city: string) => {
+      if (!pendingInterrupt) return;
+
+      const agent = agentRef.current;
+      if (!agent) return;
+
+      const interrupt = pendingInterrupt;
+      setPendingInterrupt(null);
+      setIsRunning(true);
+
+      const userMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: city,
+      };
+      const aiMsgId = crypto.randomUUID();
+      pendingMsgIdRef.current = aiMsgId;
+      pendingContentRef.current = "";
+      errorHandledRef.current = false;
+
+      setMessages((prev) => [...prev, userMsg]);
+      setMessages((prev) => [
+        ...prev,
+        { id: aiMsgId, role: "assistant", content: "", isStreaming: true, toolStatus: "正在查询天气..." },
+      ]);
+
+      try {
+        // Send resume request directly via fetch (HttpAgent doesn't natively support resume)
+        const response = await fetch("/api/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [
+              ...agent.messages.map((m) => {
+                const base = { id: m.id, role: m.role, content: m.content };
+                // Add toolCalls/assistant-specific fields if present
+                if ('toolCalls' in m && m.toolCalls) {
+                  return { ...base, toolCalls: m.toolCalls };
+                }
+                if ('toolCallId' in m && m.toolCallId) {
+                  return { ...base, toolCallId: m.toolCallId };
+                }
+                return base;
+              }),
+              { id: userMsg.id, role: "user", content: city },
+            ],
+            tools: CLIENT_TOOLS,
+            threadId: interrupt.threadId,
+            resume: [{
+              interruptId: interrupt.interruptId,
+              status: "resolved",
+              payload: { city },
+            }],
+          }),
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("No response body");
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const jsonStr = line.slice(6).trim();
+            if (!jsonStr) continue;
+
+            try {
+              const event = JSON.parse(jsonStr);
+              handleSSEEvent(event, aiMsgId);
+            } catch {
+              // Skip malformed events
+            }
+          }
+        }
+      } catch (err) {
+        if (!errorHandledRef.current) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiMsgId
+                ? { ...m, content: `请求失败：${err instanceof Error ? err.message : String(err)}`, isStreaming: false }
+                : m
+            )
+          );
+        }
+      } finally {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === aiMsgId ? { ...m, isStreaming: false, toolStatus: undefined } : m
+          )
+        );
+        setIsRunning(false);
+      }
+    },
+    [pendingInterrupt]
+  );
+
+  const handleSSEEvent = useCallback(
+    (event: Record<string, unknown>, aiMsgId: string) => {
+      const type = event.type as string;
+
+      if (type === "TEXT_MESSAGE_CONTENT") {
+        const delta = event.delta as string || "";
+        pendingContentRef.current += delta;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === aiMsgId ? { ...m, content: pendingContentRef.current } : m
+          )
+        );
+      } else if (type === "TOOL_CALL_START") {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === aiMsgId ? { ...m, toolStatus: `正在查询 ${(event as { toolCallName?: string }).toolCallName || "天气"}...` } : m
+          )
+        );
+      } else if (type === "TOOL_CALL_RESULT") {
+        try {
+          const content = (event as { content?: string }).content || "";
+          const result = JSON.parse(content);
+          if (result && result.city && result.current) {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiMsgId ? { ...m, weatherData: result as WeatherResult, toolStatus: "已获取天气数据" } : m
+              )
+            );
+          }
+        } catch {
+          // Not valid weather data
+        }
+      } else if (type === "CUSTOM") {
+        const { name, value } = event as { name: string; value: Record<string, unknown> };
+        if (name === "a2ui_create_surface") {
+          a2uiRenderer.createSurface(
+            value.surfaceId as string,
+            value.catalogId as string
+          );
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiMsgId ? { ...m, a2uiSurfaceId: value.surfaceId as string } : m
+            )
+          );
+        } else if (name === "a2ui_update_components") {
+          a2uiRenderer.updateComponents(
+            value.surfaceId as string,
+            value.components as import("@/lib/a2ui-types").A2UIComponent[]
+          );
+          setRenderTick((t) => t + 1);
+        } else if (name === "a2ui_update_data_model") {
+          a2uiRenderer.updateDataModel(
+            value.surfaceId as string,
+            value.path as string | undefined,
+            value.value
+          );
+          setRenderTick((t) => t + 1);
+        }
+      }
+    },
+    []
+  );
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter" && !e.shiftKey) {
@@ -389,6 +582,17 @@ export function ChatApp() {
               {msg.toolStatus && (
                 <div className={`text-xs text-blue-500 animate-pulse ${msg.a2uiSurfaceId || msg.weatherData ? "px-4 pt-3" : "mb-1"}`}>
                   🔧 {msg.toolStatus}
+                </div>
+              )}
+
+              {/* City input card (AG-UI interrupt) — shown before LLM text */}
+              {msg.role === "assistant" && pendingInterrupt && msg.id === pendingMsgIdRef.current && (
+                <div className="px-4 pb-4">
+                  <CityInputCard
+                    message={pendingInterrupt.message}
+                    onSubmit={handleCitySubmit}
+                    disabled={isRunning}
+                  />
                 </div>
               )}
 

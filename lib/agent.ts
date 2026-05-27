@@ -59,13 +59,28 @@ interface AguiEvent {
   [key: string]: unknown;
 }
 
+// AG-UI Interrupt types
+interface Interrupt {
+  id: string;
+  reason: string;
+  message?: string;
+  toolCallId?: string;
+  responseSchema?: Record<string, unknown>;
+}
+
+interface ResumeData {
+  interruptId: string;
+  status: "resolved" | "cancelled";
+  payload?: { city?: string };
+}
+
 // Client-side tool names — server emits TOOL_CALL events but does not execute them
 const CLIENT_TOOLS = new Set(["get_user_location"]);
 
 const SYSTEM_MESSAGE: OpenAI.Chat.Completions.ChatCompletionSystemMessageParam = {
   role: "system",
   content:
-    "你是一个专业的天气预报助手。你能用 get_weather 工具查询指定城市的实时天气，用 get_user_location 工具获取用户当前所在城市。请用中文回复，语气友好亲切。当用户询问天气时，如果用户没有指定城市，先调用 get_user_location 获取城市，再调用 get_weather 查询天气；如果用户已经指定了城市，直接调用 get_weather。注意：get_user_location 由客户端执行，调用后会中断当前对话，客户端会在执行完成后重新发起请求。\n\n重要格式规则：在回复天气信息的末尾，如果需要给出出行建议（如穿衣、带伞、防晒、补水等），请将建议内容用 <tips> 和 </tips> 标签包裹，每个建议用换行分隔。不要在 tips 外重复建议内容。示例：<tips>\n出门记得带伞\n注意防晒补水\n</tips>",
+    "你是一个专业的天气预报助手。你能用 get_weather 工具查询指定城市的实时天气，用 get_user_location 工具获取用户当前所在城市。请用中文回复，语气友好亲切。\n\n调用规则：\n1. 当用户询问天气且提到了城市名（无论是否是真实城市），必须直接调用 get_weather 工具查询。不要自行判断城市是否有效，让工具来处理。\n2. 如果用户没有指定城市，先调用 get_user_location 获取城市，再调用 get_weather 查询天气。\n3. 注意：get_user_location 由客户端执行，调用后会中断当前对话，客户端会在执行完成后重新发起请求。\n\n重要格式规则：在回复天气信息的末尾，如果需要给出出行建议（如穿衣、带伞、防晒、补水等），请将建议内容用 <tips> 和 </tips> 标签包裹，每个建议用换行分隔。不要在 tips 外重复建议内容。示例：<tips>\n出门记得带伞\n注意防晒补水\n</tips>",
 };
 
 /** Convert AG-UI messages to DeepSeek/OpenAI format (system message already included) */
@@ -134,17 +149,23 @@ async function executeTool(
  */
 export async function* runAgent(
   messages: AguiMessage[],
-  tools: AguiToolDef[]
+  tools: AguiToolDef[],
+  options?: { threadId?: string; resume?: ResumeData }
 ): AsyncGenerator<AguiEvent> {
   const runId = crypto.randomUUID();
-  const threadId = crypto.randomUUID();
+  const threadId = options?.threadId || crypto.randomUUID();
 
   yield { type: E.RUN_STARTED, runId, threadId };
 
   let errored = false;
+  let interrupted = false;
   try {
-    const result = await runConversation({ runId, messages, tools });
+    const result = await runConversation({ runId, threadId, messages, tools, resume: options?.resume });
     for await (const event of result) {
+      // Check if this is an interrupt RunFinished
+      if (event.type === E.RUN_FINISHED && 'outcome' in event && (event as { outcome?: { type?: string } }).outcome?.type === "interrupt") {
+        interrupted = true;
+      }
       yield event;
     }
   } catch (err) {
@@ -155,7 +176,8 @@ export async function* runAgent(
     };
   }
 
-  if (!errored) {
+  // Only emit RUN_FINISHED if not already interrupted or errored
+  if (!errored && !interrupted) {
     yield { type: E.RUN_FINISHED, runId, threadId };
   }
 }
@@ -163,13 +185,75 @@ export async function* runAgent(
 /** Core conversation logic with tool calling loop (max 3 rounds) */
 async function* runConversation(params: {
   runId: string;
+  threadId: string;
   messages: AguiMessage[];
   tools: AguiToolDef[];
+  resume?: ResumeData;
 }): AsyncGenerator<AguiEvent> {
-  const { messages, tools } = params;
-  let currentMessages = [...messages];
+  const { runId, threadId, tools, resume } = params;
+  let currentMessages = [...params.messages];
   const openaiTools = toOpenAITools(tools);
   let currentWeatherSurfaceId: string | null = null;
+
+  // Handle resume: if resuming from a city input interrupt, execute get_weather with the new city
+  if (resume?.status === "resolved" && resume.payload?.city) {
+    const city = resume.payload.city;
+    const toolCallId = `resume-${crypto.randomUUID().slice(0, 8)}`;
+
+    // Emit tool call events for the resume weather query
+    yield { type: E.TOOL_CALL_START, toolCallId, toolCallName: "get_weather" };
+    yield { type: E.TOOL_CALL_ARGS, toolCallId, delta: JSON.stringify({ city }) };
+    yield { type: E.TOOL_CALL_END, toolCallId };
+
+    const result = await executeTool("get_weather", { city });
+
+    yield {
+      type: E.TOOL_CALL_RESULT,
+      messageId: crypto.randomUUID(),
+      toolCallId,
+      content: result,
+      role: "tool",
+    };
+
+    // Try to emit A2UI events for successful weather result
+    try {
+      const parsed = JSON.parse(result);
+      if (parsed && parsed.city && parsed.current) {
+        const surfaceId = `weather-${runId}`;
+        currentWeatherSurfaceId = surfaceId;
+        yield a2uiEvent({ version: "v0.9", createSurface: { surfaceId, catalogId: WEATHER_CATALOG_ID } });
+        yield a2uiEvent({
+          version: "v0.9",
+          updateComponents: {
+            surfaceId,
+            components: [
+              { id: "root", component: "Column", children: ["weather_card", "tips_card"] },
+              { id: "weather_card", component: "WeatherCard" },
+              { id: "tips_card", component: "TipsCard" },
+            ],
+          },
+        });
+        yield a2uiEvent({
+          version: "v0.9",
+          updateDataModel: { surfaceId, path: "/weather", value: parsed },
+        });
+      }
+    } catch {
+      // Not valid weather data — skip A2UI
+    }
+
+    // Add tool result to messages so LLM can generate a response
+    currentMessages = [
+      ...currentMessages,
+      {
+        id: crypto.randomUUID(),
+        role: "assistant" as const,
+        content: undefined,
+        toolCalls: [{ id: toolCallId, type: "function" as const, function: { name: "get_weather", arguments: JSON.stringify({ city }) } }],
+      },
+      { id: crypto.randomUUID(), role: "tool" as const, toolCallId, content: result },
+    ];
+  }
 
   for (let round = 0; round < 3; round++) {
     // Build the full message list with system prompt first (only round 0 includes it implicitly via prepend)
@@ -340,6 +424,42 @@ async function* runConversation(params: {
               version: "v0.9",
               updateDataModel: { surfaceId, path: "/weather", value: parsed },
             });
+          } else {
+            // Weather query failed or returned invalid data — emit interrupt for city input
+            const cityName = parsedArgs.city as string || "未知";
+            const interruptId = crypto.randomUUID();
+            const interruptData: Interrupt = {
+              id: interruptId,
+              reason: "input_required",
+              message: parsed?.error
+                ? `无法找到城市"${cityName}"，请输入正确的城市名称`
+                : `查询"${cityName}"的天气失败，请输入正确的城市名称`,
+              toolCallId: tc.id,
+              responseSchema: {
+                type: "object",
+                properties: {
+                  city: { type: "string", description: "正确的城市名称，例如：北京、上海、深圳" },
+                },
+                required: ["city"],
+              },
+            };
+            // Emit custom event for client-side interrupt detection (includes threadId/runId for resume)
+            yield {
+              type: E.CUSTOM,
+              name: "interrupt",
+              value: { ...interruptData, threadId, runId },
+            };
+            // Emit RunFinished with interrupt outcome (AG-UI protocol)
+            yield {
+              type: E.RUN_FINISHED,
+              runId,
+              threadId,
+              outcome: {
+                type: "interrupt",
+                interrupts: [interruptData],
+              },
+            };
+            return; // End the run — client will resume with correct city
           }
         } catch {
           // Not valid weather data — skip A2UI

@@ -10,6 +10,8 @@ export async function POST(req: NextRequest) {
 
   const messages = body.messages || [];
   const clientTools = body.tools || [];
+  const threadId = body.threadId || undefined;
+  const resume = body.resume || undefined;
 
   // Merge built-in tools with any client tools
   const tools = [weatherToolDefinition, ...clientTools];
@@ -19,7 +21,7 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        for await (const event of runAgent(messages, tools)) {
+        for await (const event of runAgent(messages, tools, { threadId, resume })) {
           const line = `data: ${JSON.stringify(event)}\n\n`;
           controller.enqueue(encoder.encode(line));
         }

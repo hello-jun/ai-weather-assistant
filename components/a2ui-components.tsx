@@ -3,6 +3,7 @@ import { WEATHER_CATALOG_ID } from "@/lib/a2ui-catalog";
 import { getByPointer } from "@/lib/a2ui-catalog";
 import { WeatherCard } from "./weather-card";
 import { TipsCard } from "./tips-card";
+import { CityInputCard } from "./city-input-card";
 import type { WeatherResult } from "@/lib/tools";
 
 function A2UIWeatherCard({ dataModel }: A2UIComponentProps) {
@@ -39,10 +40,16 @@ function A2UIRow({ children }: A2UIComponentProps) {
   return <div className="flex flex-row gap-2 items-center">{children}</div>;
 }
 
+function A2UICityInputCard({ dataModel, onCitySubmit }: A2UIComponentProps & { onCitySubmit?: (city: string) => void }) {
+  const message = getByPointer(dataModel || {}, "/interrupt/message") as string | undefined;
+  return <CityInputCard message={message} onSubmit={onCitySubmit || (() => {})} />;
+}
+
 export const weatherCatalogRegistry: CatalogRegistry = {
   [WEATHER_CATALOG_ID]: {
     WeatherCard: A2UIWeatherCard,
     TipsCard: A2UITipsCard,
+    CityInputCard: A2UICityInputCard,
     Text: A2UIText,
     Column: A2UIColumn,
     Row: A2UIRow,
