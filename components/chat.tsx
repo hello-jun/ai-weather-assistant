@@ -368,7 +368,12 @@ export function ChatApp() {
                     }`
               }`}
             >
-              {/* A2UI surface rendering (primary path) */}
+              {/* User message */}
+              {msg.role === "user" && msg.content && (
+                <div className="whitespace-pre-wrap">{msg.content}</div>
+              )}
+
+              {/* A2UI surface rendering (WeatherCard + TipsCard) */}
               {msg.role === "assistant" && msg.a2uiSurfaceId && (() => {
                 const surface = a2uiRenderer.getSurface(msg.a2uiSurfaceId);
                 if (!surface) return null;
@@ -380,14 +385,15 @@ export function ChatApp() {
                 <WeatherCard data={msg.weatherData} />
               )}
 
+              {/* Tool status */}
               {msg.toolStatus && (
                 <div className={`text-xs text-blue-500 animate-pulse ${msg.a2uiSurfaceId || msg.weatherData ? "px-4 pt-3" : "mb-1"}`}>
                   🔧 {msg.toolStatus}
                 </div>
               )}
-              {(() => {
-                const isAssistantText = msg.role === "assistant" && msg.content;
-                if (!isAssistantText) return null;
+
+              {/* LLM text content with optional tips */}
+              {msg.role === "assistant" && msg.content && (() => {
                 const [cleanText, tips] = extractTips(msg.content);
                 const displayText = tips ? cleanText : msg.content;
                 return (
