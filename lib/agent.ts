@@ -1,5 +1,6 @@
 import { deepseek } from "./deepseek";
 import { getWeather } from "./tools";
+import { saveMessages, saveMessage } from "./message-store";
 import type OpenAI from "openai";
 import type { A2UIMessage } from "./a2ui-types";
 
@@ -153,7 +154,7 @@ export async function* runAgent(
   options?: { threadId?: string; resume?: ResumeData }
 ): AsyncGenerator<AguiEvent> {
   const runId = crypto.randomUUID();
-  const threadId = options?.threadId || crypto.randomUUID();
+  const threadId = options!.threadId!; // 由 route.ts 保证传入
 
   yield { type: E.RUN_STARTED, runId, threadId };
 
@@ -243,8 +244,7 @@ async function* runConversation(params: {
     }
 
     // Add tool result to messages so LLM can generate a response
-    currentMessages = [
-      ...currentMessages,
+    const resumeMessages = [
       {
         id: crypto.randomUUID(),
         role: "assistant" as const,
@@ -253,6 +253,8 @@ async function* runConversation(params: {
       },
       { id: crypto.randomUUID(), role: "tool" as const, toolCallId, content: result },
     ];
+    currentMessages = [...currentMessages, ...resumeMessages];
+    saveMessages(threadId, resumeMessages);
   }
 
   for (let round = 0; round < 3; round++) {
@@ -322,6 +324,8 @@ async function* runConversation(params: {
       .map(([, v]) => v);
 
     if (toolCalls.length === 0) {
+      // 持久化纯文本 assistant 回复
+      saveMessage(threadId, { id: msgId, role: "assistant", content: fullContent });
       // No tool calls — check for tips in the text and emit A2UI data model update
       if (fullContent) {
         const tips = extractTips(fullContent);
@@ -475,10 +479,7 @@ async function* runConversation(params: {
       });
     }
 
-    // Client tool detected — end the run so the client can execute it and continue
-    if (hasClientTool) break;
-
-    // Append assistant message (with tool_calls) + tool results to messages
+    // Build the assistant message with tool_calls
     const assistantMsg: AguiMessage = {
       id: msgId,
       role: "assistant",
@@ -490,7 +491,15 @@ async function* runConversation(params: {
       })),
     };
 
+    // Client tool detected — persist assistant message, then end the run
+    if (hasClientTool) {
+      saveMessage(threadId, assistantMsg);
+      break;
+    }
+
+    // Append assistant message (with tool_calls) + tool results to messages
     currentMessages = [...currentMessages, assistantMsg, ...toolResultMessages];
+    saveMessages(threadId, [assistantMsg, ...toolResultMessages]);
   }
 
   // If the model didn't produce tool calls, we're done in the first round

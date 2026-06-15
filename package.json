@@ -8,19 +8,21 @@
     "start": "next start"
   },
   "dependencies": {
-    "next": "^15.1.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "@ag-ui/core": "latest",
     "@ag-ui/client": "latest",
-    "openai": "^4.70.0"
+    "@ag-ui/core": "latest",
+    "better-sqlite3": "^12.10.1",
+    "next": "^15.1.0",
+    "openai": "^4.70.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "@types/react": "^19.0.0",
-    "@types/node": "^22.0.0",
-    "tailwindcss": "^4.0.0",
     "@tailwindcss/postcss": "^4.0.0",
-    "postcss": "^8.4.0"
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0"
   }
 }

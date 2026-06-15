@@ -223,8 +223,7 @@ export function ChatApp() {
         });
       } catch {
         const errorResult = JSON.stringify({ error: "未获取到用户定位信息，请让用户手动指定城市。" });
-        agent.addMessage({ id: crypto.randomUUID(), role: "assistant", content: "", toolCalls: [{ id: toolCallId, type: "function" as const, function: { name: "get_user_location", arguments: "{}" } }] });
-        agent.addMessage({ id: crypto.randomUUID(), role: "tool", content: errorResult, toolCallId });
+        agent.setMessages([{ id: crypto.randomUUID(), role: "tool" as const, content: errorResult, toolCallId }]);
         setMessages((prev) =>
           prev.map((m) => (m.id === currentMsgId ? { ...m, toolStatus: undefined } : m))
         );
@@ -264,14 +263,8 @@ export function ChatApp() {
         locationResult = JSON.stringify({ error: "地理编码服务暂时不可用，请让用户手动指定城市。" });
       }
 
-      // Step 3: Append tool messages and continue the conversation
-      agent.addMessage({
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: "",
-        toolCalls: [{ id: toolCallId, type: "function" as const, function: { name: "get_user_location", arguments: "{}" } }],
-      });
-      agent.addMessage({ id: crypto.randomUUID(), role: "tool", content: locationResult, toolCallId });
+      // Step 3: Only send the tool result as new message (history is persisted server-side)
+      agent.setMessages([{ id: crypto.randomUUID(), role: "tool" as const, content: locationResult, toolCallId }]);
 
       setMessages((prev) =>
         prev.map((m) => (m.id === currentMsgId ? { ...m, toolStatus: undefined } : m))
@@ -317,7 +310,7 @@ export function ChatApp() {
       ]);
 
       try {
-        agent.addMessage({ id: userMsg.id, role: "user", content: text });
+        agent.setMessages([{ id: userMsg.id, role: "user" as const, content: text }]);
         await agent.runAgent({ tools: CLIENT_TOOLS });
       } catch (err) {
         if (!errorHandledRef.current) {
@@ -380,20 +373,7 @@ export function ChatApp() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: [
-              ...agent.messages.map((m) => {
-                const base = { id: m.id, role: m.role, content: m.content };
-                // Add toolCalls/assistant-specific fields if present
-                if ('toolCalls' in m && m.toolCalls) {
-                  return { ...base, toolCalls: m.toolCalls };
-                }
-                if ('toolCallId' in m && m.toolCallId) {
-                  return { ...base, toolCallId: m.toolCallId };
-                }
-                return base;
-              }),
-              { id: userMsg.id, role: "user", content: city },
-            ],
+            messages: [{ id: userMsg.id, role: "user", content: city }],
             tools: CLIENT_TOOLS,
             threadId: interrupt.threadId,
             resume: [{
