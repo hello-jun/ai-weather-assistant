@@ -13,33 +13,35 @@ npx tsc --noEmit # Type-check without emitting files
 
 ## Architecture
 
-This is a **Next.js 15 App Router** weather AI assistant that streams responses via the **AG-UI Protocol** + **A2UI v0.9 Protocol** over SSE, backed by DeepSeek V4 API with function calling.
+This is a **Next.js 15 App Router** weather AI assistant that streams responses via the **AG-UI Protocol** + **A2UI v0.9 Protocol** over SSE, backed by DeepSeek V4 API with function calling. Uses **SQLite** (better-sqlite3) for server-side message persistence.
 
 ### Request flow
 
-1. `components/chat.tsx` — Client component using `HttpAgent` from `@ag-ui/client`. Subscribes to AG-UI events (`onTextMessageContentEvent`, `onToolCallStartEvent`, `onCustomEvent` for A2UI and interrupts) and renders streaming text updates. Sends user messages via `agent.addMessage()` + `agent.runAgent()`, which POSTs to `/api/agent`. Integrates A2UI renderer for declarative UI components (WeatherCard, TipsCard). Handles AG-UI interrupts: detects `CUSTOM interrupt` events, stores interrupt state, renders CityInputCard, and sends resume requests via fetch. Renders in event stream order: user message → A2UI surface → tool status → CityInputCard (if interrupt) → LLM text.
+1. `components/chat.tsx` — Client component using `HttpAgent` from `@ag-ui/client`. Subscribes to AG-UI events (`onTextMessageContentEvent`, `onToolCallStartEvent`, `onCustomEvent` for A2UI and interrupts) and renders streaming text updates. Sends only the **new user message** via `agent.setMessages()` + `agent.runAgent()`, which POSTs to `/api/agent`. History is managed server-side via SQLite. Integrates A2UI renderer for declarative UI components (WeatherCard, TipsCard). Handles AG-UI interrupts: detects `CUSTOM interrupt` events, stores interrupt state, renders CityInputCard, and sends resume requests via fetch. Renders in event stream order: user message → A2UI surface → tool status → CityInputCard (if interrupt) → LLM text.
 
-2. `app/api/agent/route.ts` — Edge-adjacent Node.js API route. Receives `{ messages, tools }`, merges the built-in `weatherToolDefinition` with any client-provided tools (auto-converts simplified tool format to OpenAI Function Schema), and streams AG-UI/A2UI events as SSE (`text/event-stream`). Each event is emitted as `data: <JSON>\n\n`. Never sends `data: [DONE]` — the AG-UI client uses `RUN_FINISHED` + connection close to detect completion. Supports `threadId` and `resume` parameters for AG-UI interrupt recovery.
+2. `app/api/agent/route.ts` — Edge-adjacent Node.js API route. Receives `{ messages, tools }`, loads conversation history from SQLite via `getMessages(threadId)`, merges with incoming new messages, and persists new messages via `saveMessages(threadId, newMessages)`. Merges the built-in `weatherToolDefinition` with any client-provided tools (auto-converts simplified tool format to OpenAI Function Schema), and streams AG-UI/A2UI events as SSE (`text/event-stream`). Each event is emitted as `data: <JSON>\n\n`. Never sends `data: [DONE]` — the AG-UI client uses `RUN_FINISHED` + connection close to detect completion. Supports `threadId` and `resume` parameters for AG-UI interrupt recovery.
 
-3. `lib/agent.ts` — Core agent logic as an `AsyncGenerator<AguiEvent>`. Calls DeepSeek V4 with `stream: true`, maps SSE deltas to AG-UI events (`TEXT_MESSAGE_CONTENT` for text, `TOOL_CALL_START/ARGS/END` for tool calls). Runs a tool calling loop (max 3 rounds): executes tools locally, appends results to messages, and re-invokes the LLM. Generates A2UI events for weather data (createSurface, updateComponents, updateDataModel). Implements AG-UI interrupt protocol: when `get_weather` returns error/invalid data, emits `CUSTOM interrupt` + `RUN_FINISHED { outcome: { type: "interrupt" } }`. Handles resume: accepts `resume` parameter, re-executes `get_weather` with corrected city, continues LLM conversation. On error, emits `RUN_ERROR` and stops (no `RUN_FINISHED` after error). Tracks `interrupted` flag to avoid duplicate `RUN_FINISHED`.
+3. `lib/agent.ts` — Core agent logic as an `AsyncGenerator<AguiEvent>`. Calls DeepSeek V4 with `stream: true`, maps SSE deltas to AG-UI events (`TEXT_MESSAGE_CONTENT` for text, `TOOL_CALL_START/ARGS/END` for tool calls). Runs a tool calling loop (max 3 rounds): executes tools locally, appends results to messages, and re-invokes the LLM. **Persists messages to SQLite** after each round: assistant messages with tool calls, tool results, and pure text replies. Generates A2UI events for weather data (createSurface, updateComponents, updateDataModel). Implements AG-UI interrupt protocol: when `get_weather` returns error/invalid data, emits `CUSTOM interrupt` + `RUN_FINISHED { outcome: { type: "interrupt" } }`. Handles resume: accepts `resume` parameter, re-executes `get_weather` with corrected city, continues LLM conversation. On error, emits `RUN_ERROR` and stops (no `RUN_FINISHED` after error). Tracks `interrupted` flag to avoid duplicate `RUN_FINISHED`.
 
 4. `lib/deepseek.ts` — Minimal DeepSeek API client using the OpenAI SDK v4 with `baseURL: "https://api.deepseek.com"`. Do NOT append `/v1` to the base URL; the SDK handles path construction.
 
-5. `lib/tools.ts` — Weather tool definition (simplified format: `{ name, description, parameters }`) + execution with dual-API fallback. Primary: Open-Meteo (geocoding → forecast, with retry for 5xx). Fallback: wttr.in (free, no API key, accepts city names directly). Falls back automatically when Open-Meteo is unavailable. Includes WMO weather code → Chinese description mapping.
+5. `lib/message-store.ts` — SQLite-based message persistence using `better-sqlite3`. Stores messages in `.data/messages.db` with WAL journal mode. Schema: `messages(thread_id TEXT, seq INTEGER, message JSON, PRIMARY KEY (thread_id, seq))`. Exports `saveMessage()`, `saveMessages()` (transactional batch), and `getMessages()` (ordered by seq). Messages are stored as JSON blobs with role, content, toolCallId, and toolCalls fields.
 
-6. `components/weather-card.tsx` — Gradient weather card rendered when a message has `weatherData`. Styled per WMO weather code (sunny=orange, rain=blue, snow=ice-blue, etc.) with temperature, humidity, wind speed, and daily high/low.
+6. `lib/tools.ts` — Weather tool definition (simplified format: `{ name, description, parameters }`) + execution with dual-API fallback. Primary: Open-Meteo (geocoding → forecast, with retry for 5xx). Fallback: wttr.in (free, no API key, accepts city names directly). Falls back automatically when Open-Meteo is unavailable. Includes WMO weather code → Chinese description mapping.
 
-7. `components/tips-card.tsx` — Amber-themed card for LLM-generated travel advice. Triggered by `<tips>` tags in the LLM response text.
+7. `components/weather-card.tsx` — Gradient weather card rendered when a message has `weatherData`. Styled per WMO weather code (sunny=orange, rain=blue, snow=ice-blue, etc.) with temperature, humidity, wind speed, and daily high/low.
 
-8. `lib/a2ui-types.ts` — A2UI v0.9 protocol type definitions (A2UICreateSurface, A2UIUpdateComponents, A2UIUpdateDataModel, A2UIDeleteSurface).
+8. `components/tips-card.tsx` — Amber-themed card for LLM-generated travel advice. Triggered by `<tips>` tags in the LLM response text.
 
-9. `lib/a2ui-catalog.ts` — A2UI Catalog registration, mapping component names to React renderers (WeatherCard, TipsCard, CityInputCard, Column, Row, Text, Button).
+9. `lib/a2ui-types.ts` — A2UI v0.9 protocol type definitions (A2UICreateSurface, A2UIUpdateComponents, A2UIUpdateDataModel, A2UIDeleteSurface).
 
-10. `lib/a2ui-renderer.tsx` — A2UI Surface renderer. Manages surface state (components, dataModel), resolves data bindings, and renders component trees. Includes `renderSurfaceSplit()` for selective component rendering.
+10. `lib/a2ui-catalog.ts` — A2UI Catalog registration, mapping component names to React renderers (WeatherCard, TipsCard, CityInputCard, Column, Row, Text, Button).
 
-11. `components/a2ui-components.tsx` — A2UI component implementations (A2UIWeatherCard, A2UITipsCard, A2UICityInputCard) that read from DataModel paths.
+11. `lib/a2ui-renderer.tsx` — A2UI Surface renderer. Manages surface state (components, dataModel), resolves data bindings, and renders component trees. Includes `renderSurfaceSplit()` for selective component rendering.
 
-12. `components/city-input-card.tsx` — City input card component for AG-UI interrupts. Displays an input field and confirm button when the weather tool fails. Dispatches city name via `onSubmit` callback when user clicks confirm.
+12. `components/a2ui-components.tsx` — A2UI component implementations (A2UIWeatherCard, A2UITipsCard, A2UICityInputCard) that read from DataModel paths.
+
+13. `components/city-input-card.tsx` — City input card component for AG-UI interrupts. Displays an input field and confirm button when the weather tool fails. Dispatches city name via `onSubmit` callback when user clicks confirm.
 
 ### Key implementation details
 
@@ -55,6 +57,7 @@ This is a **Next.js 15 App Router** weather AI assistant that streams responses 
 - **Client-side tools**: `get_user_location` is a client-side tool — when the LLM calls it, the server emits `TOOL_CALL_RESULT` with `metadata: { clientTool: true }` and breaks the loop. The client executes the tool (browser geolocation → Nominatim reverse geocoding) and re-invokes `agent.runAgent()` with the result appended as a tool message. The `clientToolContinuationRef` flag prevents `sendMessage`'s finally block from prematurely setting `isStreaming: false`.
 - **AG-UI interrupts**: When `get_weather` returns error/invalid data, the agent emits `CUSTOM interrupt` + `RUN_FINISHED { outcome: { type: "interrupt" } }`. The client detects this, renders `CityInputCard`, and sends a resume request via fetch with `{ threadId, resume: [{ interruptId, status: "resolved", payload: { city } }] }`. The agent re-executes `get_weather` with the corrected city and continues the conversation.
 - **System prompt**: Instructs the LLM to always call `get_weather` when the user asks about weather, even if the city seems invalid. This ensures the tool is called and the interrupt mechanism can trigger.
+- **Server-side message persistence**: Conversation history is stored in SQLite (`.data/messages.db`) via `better-sqlite3` with WAL journal mode. The client only sends new messages; the server loads history with `getMessages(threadId)`, merges, and persists new messages with `saveMessages()`. The agent also persists assistant messages and tool results during the tool calling loop. `threadId` is the conversation key — the client must send it for history continuity. `next.config.ts` marks `better-sqlite3` as `serverExternalPackages` (native module). `.data/` is gitignored.
 
 ---
 
